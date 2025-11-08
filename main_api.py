@@ -28,8 +28,9 @@ logging.basicConfig(level=logging.DEBUG, handlers=[handler])
 logger = logging.getLogger(__name__)
 
 class ShareProjectInput(BaseModel):
-    user_id: str
+    user_email: str
     project_id: str
+    user_role: str
 
 class ConfigurationInput(BaseModel):
     project_json: dict
@@ -41,6 +42,15 @@ class ConfigurationInput(BaseModel):
 class ConfigurationInput2(BaseModel):
     id_feature_model: str
     id: str
+
+class ChangeCollaboratorInput(BaseModel):
+    project_id: str
+
+class ChangeUserRoleInput(BaseModel):
+    project_id: str
+    collaborator_id: str
+    role: str
+
 
 app = FastAPI()
 
@@ -96,6 +106,13 @@ def close_db():
     db.close()
 
 
+@app.get("/getUser", dependencies=[Depends(is_authenticated)])
+async def obtener_usuario(request: Request):
+    user = request.state.user
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"data": {"user": user}}
+
 @app.post("/saveProject", dependencies=[Depends(is_authenticated)])
 async def guardar_modelo(request: Request, project_dict: dict):
     template=False
@@ -113,27 +130,64 @@ async def guardar_modelo(request: Request, project_dict: dict):
 @app.get("/getProjects", dependencies=[Depends(is_authenticated)])
 async def obtener_modelos(request: Request):
     user_id = request.state.user.id
-    return user_DAO.get_projects(user_id)
+
+    all_projects = user_DAO.get_projects(user_id)["data"]["projects"]
+    
+    owned_proyects = [project for project in all_projects if project["role"] == "owner"]
+    shared_proyects = [
+        project for project in all_projects
+          if project["role"] != "owner"
+          and project["is_collaborative"] == True
+    ]
+
+    return {
+        "owned_projects": owned_proyects,
+        "shared_projects": shared_proyects
+    }
 
 @app.get("/getTemplateProjects", dependencies=[Depends(is_authenticated)])
 async def obtener_modelos_template():
     return project_DAO.get_template_projects()
 
 @app.get("/getProject", dependencies=[Depends(is_authenticated)])
-async def obtener_modelo(project_id: str):
-    return project_DAO.get_by_id(project_id)
+async def obtener_modelo(request: Request, project_id: str):
+    user_id = request.state.user.id
+    return project_DAO.get_by_id(user_id, project_id)
 
 
 @app.post("/shareProject", dependencies=[Depends(is_authenticated)])
 async def compartir_modelo(data: ShareProjectInput):
-    return project_DAO.share_project(data.project_id, data.user_id)
 
+    user = user_DAO.get_by_email(data.user_email)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return project_DAO.share_project(data.project_id, user.id, data.user_role)
 
 @app.get("/usersProject", dependencies=[Depends(is_authenticated)])
 async def obtener_usuarios_proyecto(request: Request, project_id: str):
     user_id = request.state.user.id
     return project_DAO.get_users(project_id, user_id)
 
+@app.delete("/removeCollaborator", dependencies=[Depends(is_authenticated)])
+async def delete_collaborator_endpoint(request: Request, project_id: str, collaborator_id: str):
+    user_id = request.state.user.id
+    return project_DAO.delete_collaborator(project_id, user_id, collaborator_id)
+
+@app.post("/changeUserRole", dependencies=[Depends(is_authenticated)])
+async def cambiar_rol_usuario(request: Request, data: ChangeUserRoleInput):
+    user_id = request.state.user.id
+    return project_DAO.change_user_role(data.project_id, user_id, data.collaborator_id, data.role)
+
+@app.post("/changeProjectCollaborative", dependencies=[Depends(is_authenticated)])
+async def cambiar_colaborativo(request: Request, data: ChangeCollaboratorInput):
+    user_id = request.state.user.id
+    return project_DAO.change_project_collaborative(data.project_id, user_id)
+
+@app.get("/getUserRole", dependencies=[Depends(is_authenticated)])
+async def obtener_rol_usuario(request: Request, project_id: str):
+    user_id = request.state.user.id
+    return project_DAO.get_user_role(project_id, user_id)
 
 @app.get("/findUser")
 async def buscar_usuario_email(user_mail: str, db: Session = Depends(get_db)):
