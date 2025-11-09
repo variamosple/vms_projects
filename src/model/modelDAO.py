@@ -309,8 +309,12 @@ class ProjectDao:
             raise Exception("El usuario no existe")
         initial_configuration = {  # Lista de configuraciones ahora por modelID
         }
+
+        is_template_flag = project_dict.get("template", False)
+        is_collab = False if is_template_flag else True
+        
         project = Project(id=str(uuid4()), owner_id = user_id ,name=project_dict.get("name"), description=project_dict.get("description"), author=project_dict.get("author"), source=project_dict.get("source"), date= datetime.now(), project=project_dict.get("project"),
-                          template=project_dict.get("template"), configuration=initial_configuration)
+                          template=is_template_flag, configuration=initial_configuration, is_collaborative=is_collab)
         self.db.add(project)
         self.db.flush()  # Obtener el ID de proyecto recién creado antes de commitear
         # Asociar el proyecto con el usuario en la tabla de asociación
