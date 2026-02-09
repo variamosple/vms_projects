@@ -115,7 +115,7 @@ def _retry_after_seconds(resp: httpx.Response) -> float:
 def _build_openrouter_headers(request: Request, api_key: str) -> Dict[str, str]:
     # Estos headers son recomendados por OpenRouter; no son “seguridad”, solo metadatos.
     # Mejor fijarlos desde server y no confiar en el cliente.
-    referer = 'https://app.variamos.com' or (request.headers.get("origin") or "")
+    referer = (request.headers.get("origin") or "https://app.variamos.com")
     title = "VariaMos"
 
     return {
@@ -200,16 +200,23 @@ async def call_openrouter_rotate_keys(payload: Dict[str, Any], request: Request)
 
 app = FastAPI()
 
-ALLOWED_ORIGINS_PATTERNS = [
-    re.compile(pattern) for pattern in os.getenv('VARIAMOS_CORS_ALLOWED_ORIGINS_PATTERNS', '').split(',')
-]
+raw_patterns = [p.strip() for p in os.getenv("VARIAMOS_CORS_ALLOWED_ORIGINS_PATTERNS", "").split(",") if p.strip()]
+ALLOWED_ORIGINS_PATTERNS = []
+for p in raw_patterns:
+    try:
+        ALLOWED_ORIGINS_PATTERNS.append(re.compile(p))
+    except re.error as e:
+        logger.error(f"Invalid CORS origin regex: {p} -> {e}")
+
 
 class CustomCORSMiddleware(CORSMiddleware):
     def is_allowed_origin(self, origin: str) -> bool:
         if not origin or origin == "null":
-            return True
+            return False
+        if not ALLOWED_ORIGINS_PATTERNS:
+            return False
+        return any(p.match(origin) for p in ALLOWED_ORIGINS_PATTERNS)
 
-        return any(pattern.match(origin) for pattern in ALLOWED_ORIGINS_PATTERNS)
 
 app.add_middleware(
     CustomCORSMiddleware,
@@ -266,10 +273,17 @@ async def iniciar_app():
     project_DAO = ProjectDao(db)
     load_keys()
     global _openrouter_keys, _openrouter_client
-    _openrouter_keys = _load_openrouter_keys()
-    if not _openrouter_keys:
-        logger.warning("No OpenRouter keys configured (proxy will fail).")
-    _openrouter_client = httpx.AsyncClient(timeout=httpx.Timeout(25.0))
+    try:
+        _openrouter_keys = _load_openrouter_keys()
+        if not _openrouter_keys:
+            logger.warning("No OpenRouter keys configured (proxy will fail).")
+
+        _openrouter_client = httpx.AsyncClient(timeout=25.0)
+        logger.info("OpenRouter client initialized.")
+    except Exception as e:
+        _openrouter_client = None
+        _openrouter_keys = []
+        logger.exception(f"OpenRouter init failed (service will still run): {e}")
 
 
 @app.on_event("shutdown")
