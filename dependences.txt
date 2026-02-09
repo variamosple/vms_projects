@@ -3,7 +3,6 @@ sqlalchemy
 asyncpg
 psycopg2-binary
 python-multipart
-typing
 passlib
 python-jose[cryptography]
 fastapi
