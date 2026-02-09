@@ -1,7 +1,7 @@
 import os
 import re
 import logging
-from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi import FastAPI, Depends, HTTPException, Request, APIRouter
 from sqlalchemy.orm import Session
 from uvicorn.logging import DefaultFormatter
 
@@ -9,7 +9,7 @@ from variamos_security import (load_keys, is_authenticated, has_roles, has_permi
 
 import uuid
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Literal
 from urllib.parse import urlparse
 import httpx
 
@@ -18,12 +18,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from passlib.context import CryptContext
 from sqlalchemy.orm import Session
 from src.model.modelDAO import UserDao, ProjectDao
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from src.infrastructure.entry_points import (
     projects_admin_controller_v1,
     models_admin_controller_v1
 )
 
+
+router = APIRouter(prefix="/api/ai/", tags=["ai"])
+
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+Role = Literal["system", "user", "assistant"]
 # Configure logging
 formatter = DefaultFormatter()
 handler = logging.StreamHandler()
@@ -56,17 +62,6 @@ class ChangeUserRoleInput(BaseModel):
     collaborator_id: str
     role: str
 
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-
-class OpenRouterChatRequest(BaseModel):
-    model: str
-    messages: List[Dict[str, Any]]
-    temperature: Optional[float] = None
-    max_tokens: Optional[int] = None
-    stream: Optional[bool] = False
-
-    class Config:
-        extra = "allow"  # permite pasar campos extra si luego los necesitas (top_p, etc.)
 
 _openrouter_keys: List[str] = []
 _openrouter_key_state: Dict[str, Dict[str, Any]] = {}  # {key: {"cooldown_until": float, "disabled_until": float}}
@@ -195,6 +190,8 @@ async def call_openrouter_rotate_keys(payload: Dict[str, Any], request: Request)
 
 
 app = FastAPI()
+
+app.include_router(router)
 
 raw_patterns = [p.strip() for p in os.getenv("VARIAMOS_CORS_ALLOWED_ORIGINS_PATTERNS", "").split(",") if p.strip()]
 ALLOWED_ORIGINS_PATTERNS = []
@@ -432,20 +429,62 @@ def apply_configuration2(project_id : str, model_id : str, configuration_id: str
 def apply_configuration(project_id : str, config_input: ConfigurationInput2):
     return project_DAO.apply_configuration(project_id, config_input.id_feature_model, config_input.id)
 
-@app.post(
-    "/api/ai/openrouter/chat",
-    dependencies=[
-        Depends(enforce_allowed_web_origin)
-    ],
-)
-async def openrouter_chat_proxy(request: Request, body: OpenRouterChatRequest):
-    payload = body.dict(exclude_none=True)
 
-    # Validación mínima defensiva
-    if not payload.get("model"):
-        raise HTTPException(status_code=400, detail="Missing model")
-    if not isinstance(payload.get("messages"), list) or not payload["messages"]:
-        raise HTTPException(status_code=400, detail="Missing messages")
 
-    data = await call_openrouter_rotate_keys(payload, request)
-    return data
+class ChatMessage(BaseModel):
+    role: Role
+    content: str
+
+class AIChatRequest(BaseModel):
+    primaryModelId: str = Field(..., min_length=1)
+    fallbackModelIds: List[str] = []
+    messages: List[ChatMessage] = Field(..., min_length=1)
+
+class AIChatResult(BaseModel):
+    content: str
+    usedModelId: str
+
+@router.post("/chat", response_model=AIChatResult)
+async def chat(request: Request, req: AIChatRequest):
+    # Model cascade (igual que tu frontend)
+    models = [req.primaryModelId] + [m for m in req.fallbackModelIds if m and m != req.primaryModelId]
+    errors: List[Any] = []
+
+    for model in models:
+        payload = {
+            "model": model,
+            "messages": [m.model_dump() for m in req.messages],
+        }
+
+        try:
+            data = await call_openrouter_rotate_keys(payload, request)
+
+            content = (((data.get("choices") or [{}])[0]).get("message") or {}).get("content") or ""
+            if content.strip():
+                return {"content": content, "usedModelId": model}
+
+            errors.append({"model": model, "error": "Empty content from OpenRouter"})
+            continue
+
+        except HTTPException as he:
+            # 4xx “de payload/model”: no tiene sentido probar más modelos/keys
+            if 400 <= he.status_code <= 499:
+                raise
+            errors.append({"model": model, "status": he.status_code, "detail": he.detail})
+            if he.status_code == 503:
+                break
+            continue
+
+        except Exception as e:
+            logger.exception("Unexpected error while calling OpenRouter")
+            errors.append({"model": model, "error": str(e)})
+            continue
+
+    raise HTTPException(status_code=502, detail={"error": "All models failed", "details": errors})
+
+
+def safe_json(resp: httpx.Response):
+    try:
+        return resp.json()
+    except Exception:
+        return resp.text[:2000]
