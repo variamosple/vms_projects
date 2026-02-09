@@ -25,7 +25,7 @@ from src.infrastructure.entry_points import (
 )
 
 
-router = APIRouter(prefix="/api/ai/", tags=["ai"])
+router = APIRouter(prefix="/api/ai", tags=["ai"])
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
@@ -190,8 +190,6 @@ async def call_openrouter_rotate_keys(payload: Dict[str, Any], request: Request)
 
 
 app = FastAPI()
-
-app.include_router(router)
 
 raw_patterns = [p.strip() for p in os.getenv("VARIAMOS_CORS_ALLOWED_ORIGINS_PATTERNS", "").split(",") if p.strip()]
 ALLOWED_ORIGINS_PATTERNS = []
@@ -488,3 +486,5 @@ def safe_json(resp: httpx.Response):
         return resp.json()
     except Exception:
         return resp.text[:2000]
+
+app.include_router(router)
