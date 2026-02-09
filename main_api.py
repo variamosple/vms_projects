@@ -113,8 +113,6 @@ def _retry_after_seconds(resp: httpx.Response) -> float:
         return 0.0
 
 def _build_openrouter_headers(request: Request, api_key: str) -> Dict[str, str]:
-    # Estos headers son recomendados por OpenRouter; no son “seguridad”, solo metadatos.
-    # Mejor fijarlos desde server y no confiar en el cliente.
     referer = (request.headers.get("origin") or "https://app.variamos.com")
     title = "VariaMos"
 
@@ -141,8 +139,6 @@ async def call_openrouter_rotate_keys(payload: Dict[str, Any], request: Request)
 
     now = time.time()
     n = len(_openrouter_keys)
-
-    # orden round-robin a partir de la última usada
     start = _openrouter_last_idx % n
     ordered = _openrouter_keys[start:] + _openrouter_keys[:start]
 

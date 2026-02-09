@@ -7,6 +7,7 @@ passlib
 python-jose[cryptography]
 fastapi
 uvicorn
+pydantic<2
 httpx
 docker
 pytest
