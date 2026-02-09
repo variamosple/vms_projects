@@ -34,13 +34,12 @@ jobs:
         echo "VARIAMOS_MS_LANGUAGES_DB_DATABASE=${{vars.VARIAMOS_MS_LANGUAGES_DB_DATABASE}}" >> .env
         echo "VARIAMOS_MS_LANGUAGES_DB_USER=${{secrets.VARIAMOS_MS_LANGUAGES_DB_USER}}" >> .env
         echo "VARIAMOS_MS_LANGUAGES_DB_PASSWORD=${{secrets.VARIAMOS_MS_LANGUAGES_DB_PASSWORD}}" >> .env
+        echo "VARIAMOS_CORS_ALLOWED_ORIGINS_PATTERNS=${{secrets.VARIAMOS_CORS_ALLOWED_ORIGINS_PATTERNS}}" >> .env
+        echo "VARIAMOS_OPENROUTER_API_KEYS=${{secrets.VARIAMOS_OPENROUTER_API_KEYS }}" >> .env
 
     - name: Build and push container image to registry
       uses: docker/build-push-action@v3
 
-      env:
-        VARIAMOS_CORS_ALLOWED_ORIGINS_PATTERNS: ${{ secrets.VARIAMOS_CORS_ALLOWED_ORIGINS_PATTERNS }}
-        VARIAMOS_OPENROUTER_API_KEYS: ${{ secrets.VARIAMOS_OPENROUTER_API_KEYS }}
       with:
         context: .
         push: true
