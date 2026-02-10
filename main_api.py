@@ -256,7 +256,10 @@ async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request)
             await asyncio.sleep(0.2 + random.random() * 0.3)
             last_err = {"type": "5xx", "status": resp.status_code, "msg": err_msg}
             continue
-
+        if resp.status_code in (401, 403, 402):
+            _mark_disabled(api_key, 3600.0)
+            last_err = {"type": "disabled_key", "status": resp.status_code, "msg": err_msg}
+            continue
         # auth/credits => esa key no sirve (al menos temporalmente)
         if resp.status_code in (400, 422):
             raise HTTPException(status_code=400, detail={"error": {"message": err_msg, "payload_hint": "Invalid request to OpenRouter"}})
@@ -585,11 +588,14 @@ async def chat(request: Request, req: AIChatRequest):
 
         raise he
 
-    content = (((data.get("choices") or [{}])[0]).get("message") or {}).get("content") or ""
+    content = extract_text_content(data)
     used_model = data.get("model") or (models[0] if models else "unknown")
 
     if not content.strip():
+        logger.error("Empty content. used_model=%s data_keys=%s data=%s",
+                    used_model, list(data.keys()), safe_json_dump(data))
         raise HTTPException(status_code=502, detail={"error": "Empty content from OpenRouter"})
+
 
     return {"content": content, "usedModelId": used_model}
 
@@ -626,6 +632,33 @@ def _seconds_until_any_key_available(now: float) -> float:
         if until > now:
             waits.append(until - now)
     return min(waits) if waits else 0.0
+
+def extract_text_content(data: dict) -> str:
+    choices = data.get("choices") or []
+    if not choices:
+        return ""
+    msg = (choices[0].get("message") or {})
+
+    c = msg.get("content")
+
+    if isinstance(c, str):
+        return c
+
+    if isinstance(c, list):
+        parts = []
+        for item in c:
+            if isinstance(item, dict):
+                if item.get("type") == "text" and isinstance(item.get("text"), str):
+                    parts.append(item["text"])
+                elif isinstance(item.get("text"), str):
+                    parts.append(item["text"])
+        return "\n".join(parts).strip()
+
+    # Some providers put text here
+    if isinstance(c, dict) and isinstance(c.get("text"), str):
+        return c["text"].strip()
+
+    return ""
 
 
 app.include_router(router)
