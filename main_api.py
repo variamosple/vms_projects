@@ -258,10 +258,10 @@ async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request)
             continue
 
         # auth/credits => esa key no sirve (al menos temporalmente)
-        if resp.status_code in (401, 403, 402):
-            _mark_disabled(api_key, 3600.0)
-            last_err = {"type": "disabled_key", "status": resp.status_code, "msg": err_msg}
-            continue
+        if resp.status_code in (400, 422):
+            raise HTTPException(status_code=400, detail={"error": {"message": err_msg, "payload_hint": "Invalid request to OpenRouter"}})
+
+        # otros 4xx: cooldown y reintento como antes (si quieres)
         _mark_cooldown(api_key, 2.0)
         await asyncio.sleep(0.15 + random.random() * 0.2)
         last_err = {"type": "4xx", "status": resp.status_code, "msg": err_msg}
@@ -570,11 +570,12 @@ class AIChatResult(BaseModel):
 async def chat(request: Request, req: AIChatRequest):
 
     models = [req.primaryModelId] + [m for m in req.fallbackModelIds if m and m != req.primaryModelId]
-
+    logger.info("AI chat models count=%d models=%s", len(models), models)
+    models = models[:3]
 
     payload = {
         "models": models,
-        "route": "fallback",  # opcional, pero explícito
+        "route": "fallback", 
         "messages": [m.model_dump() for m in req.messages],
     }
 
