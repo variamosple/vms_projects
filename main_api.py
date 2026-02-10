@@ -12,7 +12,8 @@ import time
 from typing import Any, Dict, List, Optional, Literal
 from urllib.parse import urlparse
 import httpx
-
+import asyncio
+import random
 from src.db_connector import get_db, SessionLocal
 from fastapi.middleware.cors import CORSMiddleware
 from passlib.context import CryptContext
@@ -132,62 +133,78 @@ async def call_openrouter_rotate_keys(payload: Dict[str, Any], request: Request)
     if not _openrouter_keys:
         raise HTTPException(status_code=500, detail="No OpenRouter API keys configured")
 
-    now = time.time()
     n = len(_openrouter_keys)
     start = _openrouter_last_idx % n
     ordered = _openrouter_keys[start:] + _openrouter_keys[:start]
 
     last_err_msg = "All keys failed"
 
-    for idx, api_key in enumerate(ordered):
-        if not _key_available_now(api_key, now):
-            continue
+    # intentos “por rondas” para permitir esperar cooldown y reintentar
+    for _round in range(3):
+        now = time.time()
+        tried_any = False
 
-        try:
-            resp = await _openrouter_post_with_key(payload, request, api_key)
-
-            # 429: cooldown y probar otra key
-            if resp.status_code == 429:
-                ra = _retry_after_seconds(resp)
-                _mark_cooldown(api_key, ra if ra > 0 else 2.0)
-                last_err_msg = f"429 from OpenRouter (cooldown={ra}s)"
+        for idx, api_key in enumerate(ordered):
+            if not _key_available_now(api_key, now):
                 continue
 
-            # 5xx: cooldown corto y probar otra key
-            if 500 <= resp.status_code <= 599:
+            tried_any = True
+            try:
+                resp = await _openrouter_post_with_key(payload, request, api_key)
+
+                if resp.status_code == 429:
+                    ra = _retry_after_seconds(resp)
+                    wait_s = ra if ra > 0 else 2.0
+                    # jitter pequeño para evitar “thundering herd”
+                    wait_s = wait_s * (0.75 + random.random() * 0.5)
+
+                    _mark_cooldown(api_key, wait_s)
+                    last_err_msg = f"429 from OpenRouter (cooldown={wait_s:.2f}s)"
+                    continue
+
+                if 500 <= resp.status_code <= 599:
+                    _mark_cooldown(api_key, 2.0)
+                    last_err_msg = f"{resp.status_code} from OpenRouter"
+                    continue
+
+                if resp.status_code in (401, 403):
+                    _mark_disabled(api_key, 3600.0)
+                    last_err_msg = f"{resp.status_code} from OpenRouter (disabled key 1h)"
+                    continue
+
+                if 400 <= resp.status_code <= 499:
+                    try:
+                        data = resp.json()
+                    except Exception:
+                        data = {"error": {"message": resp.text}}
+                    raise HTTPException(status_code=resp.status_code, detail=data)
+
+                # OK
+                _openrouter_last_idx = (start + idx + 1) % n
+                return resp.json()
+
+            except httpx.TimeoutException:
                 _mark_cooldown(api_key, 2.0)
-                last_err_msg = f"{resp.status_code} from OpenRouter"
+                last_err_msg = "timeout calling OpenRouter"
+                continue
+            except httpx.RequestError:
+                _mark_cooldown(api_key, 2.0)
+                last_err_msg = "network error calling OpenRouter"
                 continue
 
-            # 401/403: key inválida/bloqueada → deshabilitar por más tiempo
-            if resp.status_code in (401, 403):
-                _mark_disabled(api_key, 3600.0)
-                last_err_msg = f"{resp.status_code} from OpenRouter (disabled key 1h)"
-                continue
-
-            # Otros 4xx: generalmente es error de payload/model → no tiene sentido rotar keys
-            if 400 <= resp.status_code <= 499:
-                try:
-                    data = resp.json()
-                except Exception:
-                    data = {"error": {"message": resp.text}}
-                raise HTTPException(status_code=resp.status_code, detail=data)
-
-            # OK
-            _openrouter_last_idx = (start + idx + 1) % n
-            return resp.json()
-
-        except httpx.TimeoutException:
-            _mark_cooldown(api_key, 2.0)
-            last_err_msg = "timeout calling OpenRouter"
+        wait_next = _seconds_until_any_key_available(time.time())
+        if not tried_any and wait_next > 0:
+            # espera como máximo 2s 
+            sleep_s = min(2.0, wait_next)
+            sleep_s = sleep_s * (0.75 + random.random() * 0.5)
+            await asyncio.sleep(sleep_s)
             continue
-        except httpx.RequestError:
-            _mark_cooldown(api_key, 2.0)
-            last_err_msg = "network error calling OpenRouter"
+
+        if tried_any:
+            await asyncio.sleep(0.2 + random.random() * 0.3)
             continue
 
     raise HTTPException(status_code=503, detail={"error": {"message": last_err_msg}})
-
 
 app = FastAPI()
 
@@ -486,5 +503,17 @@ def safe_json(resp: httpx.Response):
         return resp.json()
     except Exception:
         return resp.text[:2000]
+
+def _seconds_until_any_key_available(now: float) -> float:
+    waits = []
+    for k in _openrouter_keys:
+        st = _openrouter_key_state.get(k, {})
+        cd = float(st.get("cooldown_until", 0.0) or 0.0)
+        dis = float(st.get("disabled_until", 0.0) or 0.0)
+        until = max(cd, dis)
+        if until > now:
+            waits.append(until - now)
+    return min(waits) if waits else 0.0
+
 
 app.include_router(router)
