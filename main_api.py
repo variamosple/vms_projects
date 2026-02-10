@@ -108,7 +108,7 @@ async def _ensure_openrouter_initialized():
                         ", ".join(_mask_key(k) for k in _openrouter_keys))
 
         if _openrouter_client is None:
-            timeout = httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)
+            timeout = httpx.Timeout(connect=10.0, read=65.0, write=10.0, pool=10.0)
             limits = httpx.Limits(max_connections=50, max_keepalive_connections=20)
             _openrouter_client = httpx.AsyncClient(timeout=timeout, limits=limits, http2=True)
             logger.info("OpenRouter client initialized.")
@@ -478,7 +478,7 @@ async def iniciar_app():
         if not _openrouter_keys:
             logger.warning("No OpenRouter keys configured (proxy will fail).")
 
-        timeout = httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)
+        timeout = httpx.Timeout(connect=10.0, read=65.0, write=10.0, pool=10.0)
         limits = httpx.Limits(max_connections=50, max_keepalive_connections=20)
         _openrouter_client = httpx.AsyncClient(timeout=timeout, limits=limits, http2=True)
         logger.info("OpenRouter client initialized.")
@@ -644,7 +644,7 @@ from collections import deque
 
 OPENROUTER_FREE_RPM = 20
 OPENROUTER_MAX_CONCURRENCY = 5
-OPENROUTER_MAX_TOTAL_WAIT_S = 26  # < 30s front (si no usas streaming)
+OPENROUTER_MAX_TOTAL_WAIT_S = 60  # < 30s front (si no usas streaming)
 OPENROUTER_MAX_ATTEMPTS = 6
 
 _openrouter_sem = asyncio.Semaphore(OPENROUTER_MAX_CONCURRENCY)
