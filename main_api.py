@@ -199,6 +199,28 @@ def _as_int(x: Any, default: int) -> int:
         return int(x)
     except Exception:
         return default
+def _normalize_error_code(code: Any, default: int = 500) -> int:
+    if code is None:
+        return default
+    if isinstance(code, int):
+        return code
+    if isinstance(code, str):
+        s = code.strip().lower()
+        if s.isdigit():
+            return int(s)
+        # mapeos comunes
+        if "rate" in s or "limit" in s:
+            return 429
+        if "insufficient" in s or "credit" in s or s == "payment_required":
+            return 402
+        if "unauthorized" in s:
+            return 401
+        if "forbidden" in s:
+            return 403
+        if "bad_request" in s:
+            return 400
+    return default
+
 
 async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request) -> Dict[str, Any]:
     """
@@ -234,6 +256,14 @@ async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request)
             await _free_rpm_limiter.acquire()
 
         try:
+            logger.info(
+                "OpenRouter payload: model=%s models=%s route=%s user=%s",
+                payload.get("model"),
+                payload.get("models"),
+                payload.get("route"),
+                payload.get("user"),
+            )
+            logger.info("OpenRouter key used: %s", _mask_key(api_key))
             async with _openrouter_sem:
                 resp = await _openrouter_post_with_key(payload, request, api_key)
         except httpx.TimeoutException:
@@ -253,25 +283,23 @@ async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request)
 
             body_err = _openrouter_body_error(data)  # <- debe devolver dict o None
             if body_err:
-                code = _as_int(body_err.get("code"), 500)
+                code = _normalize_error_code(body_err.get("code"), 500)
                 err_msg = str(body_err.get("message") or "")
 
                 # Tratar el "error en body" como si fuera status real
                 if code == 429:
-                    # aplica misma lógica de 429
-                    wait_s = 2.5
                     ra = _retry_after_seconds(resp)
-                    if ra > 0:
-                        wait_s = ra
+                    wait_s = ra if ra > 0 else 2.5
                     wait_s = wait_s * (0.75 + random.random() * 0.5)
 
-                    for k in _openrouter_keys:
-                        _mark_cooldown(k, wait_s)
+                    # ✅ SOLO la key que falló
+                    _mark_cooldown(api_key, wait_s)
 
                     remaining = max(0.0, deadline - time.monotonic())
                     await asyncio.sleep(min(wait_s, remaining))
-                    last_err = {"type": "429", "wait": wait_s, "msg": err_msg, "body_error": body_err}
+                    last_err = {"type": "429", "wait": wait_s, "msg": err_msg, "body_error": body_err, "key": _mask_key(api_key)}
                     continue
+
 
                 if code == 402:
                     _mark_disabled(api_key, 3600.0)
@@ -311,19 +339,19 @@ async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request)
         else:
             err_msg = str(body)[:300]
 
-        # 429 => espera y reintenta (sin devolverlo directo)
         if resp.status_code == 429:
             ra = _retry_after_seconds(resp)
             wait_s = ra if ra > 0 else 2.5
             wait_s = wait_s * (0.75 + random.random() * 0.5)
 
-            for k in _openrouter_keys:
-                _mark_cooldown(k, wait_s)
+            # ✅ SOLO la key que falló
+            _mark_cooldown(api_key, wait_s)
 
             remaining = max(0.0, deadline - time.monotonic())
             await asyncio.sleep(min(wait_s, remaining))
-            last_err = {"type": "429", "wait": wait_s, "msg": err_msg}
+            last_err = {"type": "429", "wait": wait_s, "msg": err_msg, "key": _mask_key(api_key)}
             continue
+
 
         # 5xx => reintenta
         if 500 <= resp.status_code <= 599:
@@ -672,29 +700,33 @@ class AIChatResult(BaseModel):
 async def chat(request: Request, req: AIChatRequest):
 
     models = [req.primaryModelId] + [m for m in req.fallbackModelIds if m and m != req.primaryModelId]
-    logger.info("AI chat models count=%d models=%s", len(models), models)
     models = models[:3]
 
+    user_id = getattr(getattr(request, "state", None), "user", None)
+    stable_user = None
+    if user_id and getattr(user_id, "id", None):
+        stable_user = str(user_id.id)
+
     payload = {
-        "model": models[0],          # compatibilidad extra
-        "models": models,            # fallbacks en orden
+        "model": models[0],                 
         "messages": [m.model_dump() for m in req.messages],
+        "stream": False,
     }
 
-    try:
-        data = await call_openrouter_best_effort(payload, request)
-    except HTTPException as he:
+    if len(models) > 1:
+        payload["models"] = models
+        payload["route"] = "fallback"
 
-        raise he
+    if stable_user:
+        payload["user"] = stable_user
+
+    data = await call_openrouter_best_effort(payload, request)
 
     content = extract_text_content(data)
     used_model = data.get("model") or (models[0] if models else "unknown")
 
     if not content.strip():
-        logger.error("Empty content. used_model=%s data=%s",
-                    used_model, data)
-        raise HTTPException(status_code=502, detail={"error": "Empty content from OpenRouter"})
-
+        raise HTTPException(status_code=502, detail={"error": "Empty content from OpenRouter", "usedModelId": used_model})
 
     return {"content": content, "usedModelId": used_model}
 
