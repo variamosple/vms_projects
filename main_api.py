@@ -592,8 +592,8 @@ async def chat(request: Request, req: AIChatRequest):
     used_model = data.get("model") or (models[0] if models else "unknown")
 
     if not content.strip():
-        logger.error("Empty content. used_model=%s data_keys=%s data=%s",
-                    used_model, list(data.keys()), safe_json_dump(data))
+        logger.error("Empty content. used_model=%s data=%s",
+                    used_model, data)
         raise HTTPException(status_code=502, detail={"error": "Empty content from OpenRouter"})
 
 
