@@ -470,7 +470,7 @@ async def chat(request: Request, req: AIChatRequest):
                 raise
             errors.append({"model": model, "status": he.status_code, "detail": he.detail})
             if he.status_code == 503:
-                break
+                continue
             continue
 
         except Exception as e:
