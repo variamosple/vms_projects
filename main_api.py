@@ -127,84 +127,110 @@ async def _openrouter_post_with_key(payload: Dict[str, Any], request: Request, a
     headers = _build_openrouter_headers(request, api_key)
     return await _openrouter_client.post(OPENROUTER_URL, json=payload, headers=headers)
 
-async def call_openrouter_rotate_keys(payload: Dict[str, Any], request: Request) -> Dict[str, Any]:
+async def _pick_key_round_robin(now: float) -> Optional[str]:
     global _openrouter_last_idx
 
     if not _openrouter_keys:
-        raise HTTPException(status_code=500, detail="No OpenRouter API keys configured")
+        return None
 
     n = len(_openrouter_keys)
-    start = _openrouter_last_idx % n
-    ordered = _openrouter_keys[start:] + _openrouter_keys[:start]
 
-    last_err_msg = "All keys failed"
+    async with _openrouter_rr_lock:
+        start = _openrouter_last_idx % n
+        for i in range(n):
+            k = _openrouter_keys[(start + i) % n]
+            if _key_available_now(k, now):
+                _openrouter_last_idx = (start + i + 1) % n
+                return k
 
-    # intentos “por rondas” para permitir esperar cooldown y reintentar
-    for _round in range(3):
+    return None
+
+async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request) -> Dict[str, Any]:
+    """
+    1) NO hace fan-out por modelos: manda 1 request con `models` (fallback server-side)
+    2) Throttle a 20 RPM si es :free
+    3) Concurrency limitada
+    4) Reintenta internamente 429/5xx/timeouts y rota keys si 401/403/402
+    """
+    if not _openrouter_keys:
+        raise HTTPException(status_code=500, detail="No OpenRouter API keys configured")
+
+    deadline = time.monotonic() + OPENROUTER_MAX_TOTAL_WAIT_S
+    last_err: Any = None
+
+    for attempt in range(OPENROUTER_MAX_ATTEMPTS):
+        if time.monotonic() >= deadline:
+            break
+
         now = time.time()
-        tried_any = False
+        api_key = await _pick_key_round_robin(now)
 
-        for idx, api_key in enumerate(ordered):
-            if not _key_available_now(api_key, now):
-                continue
-
-            tried_any = True
-            try:
-                resp = await _openrouter_post_with_key(payload, request, api_key)
-
-                if resp.status_code == 429:
-                    ra = _retry_after_seconds(resp)
-                    wait_s = ra if ra > 0 else 2.0
-                    # jitter pequeño para evitar “thundering herd”
-                    wait_s = wait_s * (0.75 + random.random() * 0.5)
-
-                    _mark_cooldown(api_key, wait_s)
-                    last_err_msg = f"429 from OpenRouter (cooldown={wait_s:.2f}s)"
-                    continue
-
-                if 500 <= resp.status_code <= 599:
-                    _mark_cooldown(api_key, 2.0)
-                    last_err_msg = f"{resp.status_code} from OpenRouter"
-                    continue
-
-                if resp.status_code in (401, 403):
-                    _mark_disabled(api_key, 3600.0)
-                    last_err_msg = f"{resp.status_code} from OpenRouter (disabled key 1h)"
-                    continue
-
-                if 400 <= resp.status_code <= 499:
-                    try:
-                        data = resp.json()
-                    except Exception:
-                        data = {"error": {"message": resp.text}}
-                    raise HTTPException(status_code=resp.status_code, detail=data)
-
-                # OK
-                _openrouter_last_idx = (start + idx + 1) % n
-                return resp.json()
-
-            except httpx.TimeoutException:
-                _mark_cooldown(api_key, 2.0)
-                last_err_msg = "timeout calling OpenRouter"
-                continue
-            except httpx.RequestError:
-                _mark_cooldown(api_key, 2.0)
-                last_err_msg = "network error calling OpenRouter"
-                continue
-
-        wait_next = _seconds_until_any_key_available(time.time())
-        if not tried_any and wait_next > 0:
-            # espera como máximo 2s 
-            sleep_s = min(2.0, wait_next)
-            sleep_s = sleep_s * (0.75 + random.random() * 0.5)
+        if not api_key:
+            # todas en cooldown/disabled -> espera un poco hasta que alguna quede libre
+            wait_next = _seconds_until_any_key_available(time.time())
+            sleep_s = min(1.0, wait_next) if wait_next > 0 else 0.25
             await asyncio.sleep(sleep_s)
             continue
 
-        if tried_any:
-            await asyncio.sleep(0.2 + random.random() * 0.3)
+        # rate limit (especialmente para :free)
+        if _payload_uses_free_models(payload):
+            await _free_rpm_limiter.acquire()
+
+        try:
+            async with _openrouter_sem:
+                resp = await _openrouter_post_with_key(payload, request, api_key)
+        except httpx.TimeoutException:
+            _mark_cooldown(api_key, 1.5)
+            last_err = {"type": "timeout", "attempt": attempt + 1}
+            continue
+        except httpx.RequestError as e:
+            _mark_cooldown(api_key, 1.5)
+            last_err = {"type": "network", "attempt": attempt + 1, "msg": str(e)}
             continue
 
-    raise HTTPException(status_code=503, detail={"error": {"message": last_err_msg}})
+        # OK
+        if resp.status_code == 200:
+            return resp.json()
+
+        body = safe_json(resp)
+        err_msg = ""
+        if isinstance(body, dict):
+            err_msg = str((body.get("error") or {}).get("message") or "")
+        else:
+            err_msg = str(body)[:300]
+
+        # 429 => no lo devuelvas al usuario; espera y reintenta
+        if resp.status_code == 429:
+            ra = _retry_after_seconds(resp)
+            wait_s = ra if ra > 0 else 2.5
+            wait_s = wait_s * (0.75 + random.random() * 0.5)
+
+            # En la práctica, para :free conviene "enfriar" todas para evitar martillar
+            for k in _openrouter_keys:
+                _mark_cooldown(k, wait_s)
+
+            remaining = max(0.0, deadline - time.monotonic())
+            await asyncio.sleep(min(wait_s, remaining))
+            last_err = {"type": "429", "wait": wait_s, "msg": err_msg}
+            continue
+
+        # 5xx => espera corto y reintenta (OpenRouter ya intenta fallback a nivel provider, pero a veces igual falla)
+        if 500 <= resp.status_code <= 599:
+            _mark_cooldown(api_key, 1.0 + attempt * 0.5)
+            await asyncio.sleep(0.2 + random.random() * 0.3)
+            last_err = {"type": "5xx", "status": resp.status_code, "msg": err_msg}
+            continue
+
+        # auth/credits => esa key no sirve (al menos temporalmente)
+        if resp.status_code in (401, 403, 402):
+            _mark_disabled(api_key, 3600.0)
+            last_err = {"type": "disabled_key", "status": resp.status_code, "msg": err_msg}
+            continue
+        _mark_cooldown(api_key, 2.0)
+        await asyncio.sleep(0.15 + random.random() * 0.2)
+        last_err = {"type": "4xx", "status": resp.status_code, "msg": err_msg}
+        continue
+    raise HTTPException(status_code=503, detail={"error": {"message": "OpenRouter unavailable", "last": last_err}})
 
 app = FastAPI()
 
@@ -286,7 +312,9 @@ async def iniciar_app():
         if not _openrouter_keys:
             logger.warning("No OpenRouter keys configured (proxy will fail).")
 
-        _openrouter_client = httpx.AsyncClient(timeout=25.0)
+        timeout = httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)
+        limits = httpx.Limits(max_connections=50, max_keepalive_connections=20)
+        _openrouter_client = httpx.AsyncClient(timeout=timeout, limits=limits, http2=True)
         logger.info("OpenRouter client initialized.")
     except Exception as e:
         _openrouter_client = None
@@ -445,6 +473,48 @@ def apply_configuration(project_id : str, config_input: ConfigurationInput2):
     return project_DAO.apply_configuration(project_id, config_input.id_feature_model, config_input.id)
 
 
+from collections import deque
+
+OPENROUTER_FREE_RPM = 20
+OPENROUTER_MAX_CONCURRENCY = 5
+OPENROUTER_MAX_TOTAL_WAIT_S = 26  # < 30s front (si no usas streaming)
+OPENROUTER_MAX_ATTEMPTS = 6
+
+_openrouter_sem = asyncio.Semaphore(OPENROUTER_MAX_CONCURRENCY)
+_openrouter_rr_lock = asyncio.Lock()
+
+class SlidingWindowRateLimiter:
+    def __init__(self, max_calls: int, window_seconds: float):
+        self.max_calls = max_calls
+        self.window_seconds = window_seconds
+        self._lock = asyncio.Lock()
+        self._calls = deque()
+
+    async def acquire(self):
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                # limpia llamadas viejas
+                while self._calls and (now - self._calls[0]) >= self.window_seconds:
+                    self._calls.popleft()
+
+                if len(self._calls) < self.max_calls:
+                    self._calls.append(now)
+                    return
+
+                wait_s = self.window_seconds - (now - self._calls[0])
+
+            await asyncio.sleep(max(0.0, wait_s))
+
+_free_rpm_limiter = SlidingWindowRateLimiter(OPENROUTER_FREE_RPM, 60.0)
+
+def _payload_uses_free_models(payload: Dict[str, Any]) -> bool:
+    ms = payload.get("models")
+    if isinstance(ms, list) and ms:
+        return any(isinstance(m, str) and m.endswith(":free") for m in ms)
+    m = payload.get("model")
+    return isinstance(m, str) and m.endswith(":free")
+
 
 class ChatMessage(BaseModel):
     role: Role
@@ -461,41 +531,29 @@ class AIChatResult(BaseModel):
 
 @router.post("/chat", response_model=AIChatResult)
 async def chat(request: Request, req: AIChatRequest):
-    # Model cascade (igual que tu frontend)
+
     models = [req.primaryModelId] + [m for m in req.fallbackModelIds if m and m != req.primaryModelId]
-    errors: List[Any] = []
 
-    for model in models:
-        payload = {
-            "model": model,
-            "messages": [m.model_dump() for m in req.messages],
-        }
 
-        try:
-            data = await call_openrouter_rotate_keys(payload, request)
+    payload = {
+        "models": models,
+        "route": "fallback",  # opcional, pero explícito
+        "messages": [m.model_dump() for m in req.messages],
+    }
 
-            content = (((data.get("choices") or [{}])[0]).get("message") or {}).get("content") or ""
-            if content.strip():
-                return {"content": content, "usedModelId": model}
+    try:
+        data = await call_openrouter_best_effort(payload, request)
+    except HTTPException as he:
 
-            errors.append({"model": model, "error": "Empty content from OpenRouter"})
-            continue
+        raise he
 
-        except HTTPException as he:
-            # 4xx “de payload/model”: no tiene sentido probar más modelos/keys
-            if 400 <= he.status_code <= 499:
-                raise
-            errors.append({"model": model, "status": he.status_code, "detail": he.detail})
-            if he.status_code == 503:
-                continue
-            continue
+    content = (((data.get("choices") or [{}])[0]).get("message") or {}).get("content") or ""
+    used_model = data.get("model") or (models[0] if models else "unknown")
 
-        except Exception as e:
-            logger.exception("Unexpected error while calling OpenRouter")
-            errors.append({"model": model, "error": str(e)})
-            continue
+    if not content.strip():
+        raise HTTPException(status_code=502, detail={"error": "Empty content from OpenRouter"})
 
-    raise HTTPException(status_code=502, detail={"error": "All models failed", "details": errors})
+    return {"content": content, "usedModelId": used_model}
 
 
 def safe_json(resp: httpx.Response):
