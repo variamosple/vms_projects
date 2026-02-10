@@ -251,8 +251,6 @@ async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request)
             await asyncio.sleep(min(wait_s, remaining))
             last_err = {"type": "429", "wait": wait_s, "msg": err_msg}
             continue
-
-        # 5xx => espera corto y reintenta (OpenRouter ya intenta fallback a nivel provider, pero a veces igual falla)
         if 500 <= resp.status_code <= 599:
             _mark_cooldown(api_key, 1.0 + attempt * 0.5)
             await asyncio.sleep(0.2 + random.random() * 0.3)

@@ -7,7 +7,7 @@ passlib
 python-jose[cryptography]
 fastapi
 uvicorn
-httpx
+httpx[http2]
 docker
 pytest
 variamos-security
