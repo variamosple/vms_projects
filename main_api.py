@@ -83,6 +83,43 @@ def _load_openrouter_keys() -> List[str]:
               or "").strip()
     return [single] if single else []
 
+OPENROUTER_KEYINFO_URL = "https://openrouter.ai/api/v1/key"
+_openrouter_init_lock = asyncio.Lock()
+
+def _mask_key(k: str) -> str:
+    if not k:
+        return "empty"
+    if len(k) <= 10:
+        return "***"
+    return f"{k[:6]}…{k[-4:]}"
+
+async def _ensure_openrouter_initialized():
+    global _openrouter_keys, _openrouter_client
+
+    if _openrouter_keys and _openrouter_client is not None:
+        return
+
+    async with _openrouter_init_lock:
+        # re-check dentro del lock
+        if not _openrouter_keys:
+            _openrouter_keys = _load_openrouter_keys()
+            logger.info("OpenRouter keys loaded: %d [%s]",
+                        len(_openrouter_keys),
+                        ", ".join(_mask_key(k) for k in _openrouter_keys))
+
+        if _openrouter_client is None:
+            timeout = httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)
+            limits = httpx.Limits(max_connections=50, max_keepalive_connections=20)
+            _openrouter_client = httpx.AsyncClient(timeout=timeout, limits=limits, http2=True)
+            logger.info("OpenRouter client initialized.")
+
+async def _check_key(api_key: str) -> dict:
+    # Verifica que la key realmente sirve
+    headers = {"Authorization": f"Bearer {api_key}"}
+    resp = await _openrouter_client.get(OPENROUTER_KEYINFO_URL, headers=headers)
+    return {"status": resp.status_code, "body": safe_json(resp)}
+
+
 def _key_available_now(api_key: str, now: float) -> bool:
     st = _openrouter_key_state.get(api_key, {})
     cooldown_until = float(st.get("cooldown_until", 0.0) or 0.0)
@@ -152,6 +189,7 @@ async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request)
     3) Concurrency limitada
     4) Reintenta internamente 429/5xx/timeouts y rota keys si 401/403/402
     """
+    await _ensure_openrouter_initialized()
     if not _openrouter_keys:
         raise HTTPException(status_code=500, detail="No OpenRouter API keys configured")
 
@@ -320,6 +358,7 @@ async def iniciar_app():
         _openrouter_client = None
         _openrouter_keys = []
         logger.exception(f"OpenRouter init failed (service will still run): {e}")
+    await _ensure_openrouter_initialized()
 
 
 @app.on_event("shutdown")
@@ -555,6 +594,22 @@ async def chat(request: Request, req: AIChatRequest):
 
     return {"content": content, "usedModelId": used_model}
 
+
+@router.get("/_debug/openrouter", dependencies=[Depends(is_authenticated)])
+async def debug_openrouter():
+    await _ensure_openrouter_initialized()
+    info = []
+    for k in _openrouter_keys:
+        try:
+            r = await _check_key(k)
+        except Exception as e:
+            r = {"status": "error", "body": str(e)}
+        info.append({"key": _mask_key(k), "check": r})
+    return {
+        "keys_loaded": len(_openrouter_keys),
+        "client_ready": _openrouter_client is not None,
+        "keys": info,
+    }
 
 def safe_json(resp: httpx.Response):
     try:
