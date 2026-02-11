@@ -352,138 +352,172 @@ def _openrouter_any_error(data: Any) -> Optional[Dict[str, Any]]:
 
     return None
 
-
 async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request) -> Dict[str, Any]:
     """
-    PROXY LIMPIO (sin fallback de modelos):
-      - 1 modelo por request
-      - rota keys si una key está rate-limited o rechazada
-      - aplica throttle local para evitar 429 en OpenRouter
-      - devuelve error claro al front (para que el front decida fallback de modelo)
+    1 sola llamada a OpenRouter por request.
+    - Usa round-robin para elegir key disponible
+    - Si la respuesta indica problema de API key (401/403/402 o mensaje tipo invalid key),
+      marca esa key como disabled para que la PRÓXIMA request rote.
+    - Log completo de: payload enviado, headers enviados (sin Authorization real),
+      status/headers/body recibidos.
     """
     await _ensure_openrouter_initialized()
     if not _openrouter_keys:
-        raise HTTPException(status_code=500, detail="No OpenRouter API keys configured")
+        raise HTTPException(status_code=500, detail={"error": {"message": "No OpenRouter API keys configured"}})
 
     model = payload.get("model")
     if not isinstance(model, str) or not model.strip():
         raise HTTPException(status_code=400, detail={"error": {"message": "Missing 'model' in payload"}})
     model = model.strip()
 
-    payload2 = {
+    payload2: Dict[str, Any] = {
         "model": model,
         "messages": payload.get("messages") or [],
         "stream": False,
     }
     if isinstance(payload.get("user"), str) and payload["user"].strip():
         payload2["user"] = payload["user"].strip()
-    max_key_tries = min(len(_openrouter_keys), 10)
-    last_exc: Optional[HTTPException] = None
+    MAX_BODY_LOG_CHARS = 200_000  # suficientemente grande para "ver todo" sin reventar logs
 
-    for _ in range(max_key_tries):
-        now_epoch = time.time()
-        api_key = await _pick_key_round_robin(now_epoch)
+    def _truncate_text(s: str, limit: int) -> str:
+        if not isinstance(s, str):
+            s = str(s)
+        if limit <= 0:
+            return s
+        return s if len(s) <= limit else (s[:limit] + "…[truncated]")
 
-        # Si hay keys pero todas están en cooldown/disabled, responde 429 con retryAfter
-        if not api_key:
-            wait_s = _seconds_until_any_key_available(time.time()) or 1.0
+    def _mask_headers_for_log(h: Dict[str, str]) -> Dict[str, str]:
+        hh = dict(h or {})
+        if "Authorization" in hh:
+            hh["Authorization"] = "Bearer ***"
+        return hh
+
+    def _is_key_error(status_code: int, body: Any) -> bool:
+        # Casos claros por HTTP status
+        if status_code in (401, 403, 402):
+            return True
+
+        # Casos por body
+        if isinstance(body, dict):
+            err = body.get("error")
+            if isinstance(err, dict):
+                code = err.get("code")
+                msg = str(err.get("message") or "").lower()
+
+                # OpenRouter a veces pone code numérico en el body
+                if isinstance(code, int) and code in (401, 403, 402):
+                    return True
+
+                # Heurística por mensaje
+                key_words = ("api key", "apikey", "key", "token")
+                bad_words = ("invalid", "unauthorized", "forbidden", "rejected", "missing")
+                if any(k in msg for k in key_words) and any(b in msg for b in bad_words):
+                    return True
+
+        return False
+
+    now_epoch = time.time()
+    api_key = await _pick_key_round_robin(now_epoch)
+    if not api_key:
+        wait_s = _seconds_until_any_key_available(time.time()) or 1.0
+        raise HTTPException(
+            status_code=429,
+            detail={"error": {"message": "No API key available (cooldown/disabled)", "retryAfter": wait_s}},
+            headers={"Retry-After": str(int(max(1.0, wait_s)))},
+        )
+
+    if model.endswith(":free"):
+        await _free_global_limiter.acquire()
+        await _limiter_for_key(api_key).acquire()
+
+    headers = _build_openrouter_headers(request, api_key)
+    headers_log = _mask_headers_for_log(headers)
+
+    # --- LOG SEND ---
+    logger.info("[openrouter][SEND] url=%s", OPENROUTER_URL)
+    logger.info("[openrouter][SEND] model=%s key=%s", model, _mask_key(api_key))
+    logger.info("[openrouter][SEND] headers=%s", headers_log)
+    logger.info("[openrouter][SEND] payload=%s", payload2)
+
+    t0 = time.time()
+    try:
+        async with _openrouter_sem:
+            resp = await _openrouter_client.post(OPENROUTER_URL, json=payload2, headers=headers)
+    except httpx.TimeoutException as e:
+        _mark_cooldown(api_key, 3.0)
+        logger.exception("[openrouter][RECV] TIMEOUT key=%s err=%s", _mask_key(api_key), str(e))
+        raise HTTPException(status_code=504, detail={"error": {"message": "OpenRouter timeout", "exception": str(e)}})
+    except httpx.RequestError as e:
+        _mark_cooldown(api_key, 3.0)
+        logger.exception("[openrouter][RECV] NETWORK_ERROR key=%s err=%s", _mask_key(api_key), str(e))
+        raise HTTPException(status_code=502, detail={"error": {"message": "Network error to OpenRouter", "exception": str(e)}})
+
+    elapsed = time.time() - t0
+    try:
+        raw_text = resp.text
+    except Exception:
+        raw_text = "<unable to read resp.text>"
+
+    logger.info("[openrouter][RECV] status=%s elapsed=%.3fs model=%s key=%s retry-after=%s",
+                resp.status_code, elapsed, model, _mask_key(api_key), resp.headers.get("retry-after"))
+    logger.info("[openrouter][RECV] headers=%s", dict(resp.headers))
+    logger.info("[openrouter][RECV] body_raw=%s", _truncate_text(raw_text, MAX_BODY_LOG_CHARS))
+
+    body = safe_json(resp)
+
+    if resp.status_code != 200:
+        if resp.status_code == 429:
+            wait_s = _retry_after_seconds(resp) or 8.0
+            _mark_cooldown(api_key, wait_s)
+            _mark_model_cooldown(model, wait_s)
+        if _is_key_error(resp.status_code, body):
+            _mark_disabled(api_key, 200)  # 1 hora; ajusta si quieres más
+            logger.warning("[openrouter] key disabled for next requests: %s (status=%s)", _mask_key(api_key), resp.status_code)
+
+        # Propaga status upstream tal cual
+        headers_out = {}
+        ra = resp.headers.get("retry-after")
+        if ra:
+            headers_out["Retry-After"] = ra
+
+        raise HTTPException(
+            status_code=resp.status_code,
+            detail={
+                "error": {"message": "Upstream OpenRouter error", "status": resp.status_code, "model": model},
+                "upstream": body,
+            },
+            headers=headers_out or None,
+        )
+    or_err = _openrouter_any_error(body) if isinstance(body, dict) else None
+    if or_err:
+        code = _normalize_error_code(or_err.get("code"), 502)
+        if _is_key_error(code, body):
+            _mark_disabled(api_key, 3600.0)
+            logger.warning("[openrouter] key disabled for next requests: %s (embedded_error)", _mask_key(api_key))
+
+        if code == 429:
+            wait_s = _retry_after_seconds(resp) or 8.0
+            _mark_cooldown(api_key, wait_s)
+            _mark_model_cooldown(model, wait_s)
             raise HTTPException(
                 status_code=429,
-                detail={"error": {"message": "No API key available (cooldown)", "retryAfter": wait_s}},
-                headers={"Retry-After": str(int(max(1.0, wait_s)))},
+                detail={"error": {"message": str(or_err.get("message") or "Rate limited"), "retryAfter": wait_s}},
+                headers={"Retry-After": str(int(wait_s))},
             )
 
-        # throttle local
-        if model.endswith(":free"):
-            await _free_global_limiter.acquire()
-            await _limiter_for_key(api_key).acquire()
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": {
+                    "message": str(or_err.get("message") or "OpenRouter embedded error"),
+                    "where": or_err.get("where"),
+                    "metadata": or_err.get("metadata"),
+                },
+                "upstream": body,
+            },
+        )
 
-        try:
-            async with _openrouter_sem:
-                resp = await _openrouter_post_with_key(payload2, request, api_key)
-                body = safe_json(resp)
-                logger.info(
-                "[openrouter] status=%s model=%s key=%s retry-after=%s body=%s",
-                resp.status_code,
-                model,
-                _mask_key(api_key),
-                resp.headers.get("retry-after"),
-                _summarize_openrouter_data(body) if isinstance(body, dict) else str(body)[:300]
-                )
-        except httpx.TimeoutException:
-            _mark_cooldown(api_key, 3.0)
-            last_exc = HTTPException(status_code=504, detail={"error": {"message": "OpenRouter timeout"}})
-            continue
-        except httpx.RequestError as e:
-            _mark_cooldown(api_key, 3.0)
-            last_exc = HTTPException(status_code=502, detail={"error": {"message": f"Network error: {str(e)}"}})
-            continue
-
-        # HTTP != 200
-        if resp.status_code != 200:
-            body = safe_json(resp)
-            msg = ""
-            if isinstance(body, dict):
-                msg = str((body.get("error") or {}).get("message") or "")
-            if not msg:
-                msg = str(body)[:400]
-
-            if resp.status_code == 429:
-                wait_s = _retry_after_seconds(resp) or 8.0
-                _mark_cooldown(api_key, wait_s)
-                _mark_model_cooldown(model, wait_s)
-                last_exc = HTTPException(
-                    status_code=429,
-                    detail={"error": {"message": msg or "Rate limited", "retryAfter": wait_s}},
-                    headers={"Retry-After": str(int(wait_s))},
-                )
-                continue
-
-            if resp.status_code in (401, 403):
-                _mark_disabled(api_key, 120.0)
-                last_exc = HTTPException(status_code=502, detail={"error": {"message": msg or "OpenRouter key rejected"}})
-                continue
-
-            if resp.status_code == 404:
-                raise HTTPException(status_code=404, detail={"error": {"message": msg or "Model not found"}})
-
-            if resp.status_code in (400, 422):
-                raise HTTPException(status_code=400, detail={"error": {"message": msg or "Invalid request"}})
-
-            _mark_cooldown(api_key, 5.0)
-            last_exc = HTTPException(status_code=502, detail={"error": {"message": msg or "Upstream error"}})
-            continue
-
-        # HTTP 200: puede traer error embebido
-        data = safe_json(resp)
-        or_err = _openrouter_any_error(data)
-        if or_err:
-            code = _normalize_error_code(or_err.get("code"), 502)
-            err_msg = str(or_err.get("message") or "OpenRouter embedded error")
-
-            if code == 429:
-                wait_s = _retry_after_seconds(resp) or 8.0
-                _mark_cooldown(api_key, wait_s)
-                last_exc = HTTPException(
-                    status_code=429,
-                    detail={"error": {"message": err_msg, "retryAfter": wait_s}},
-                    headers={"Retry-After": str(int(wait_s))},
-                )
-                continue
-
-            _mark_cooldown(api_key, 3.0)
-            last_exc = HTTPException(
-                status_code=502,
-                detail={"error": {"message": err_msg, "where": or_err.get("where"), "metadata": or_err.get("metadata")}},
-            )
-            continue
-
-        return data
-
-    if last_exc:
-        raise last_exc
-
-    raise HTTPException(status_code=503, detail={"error": {"message": "OpenRouter unavailable"}})
+    return body
 
 
 app = FastAPI()
@@ -814,7 +848,11 @@ def safe_json(resp: httpx.Response):
     try:
         return resp.json()
     except Exception:
-        return resp.text[:2000]
+        try:
+            return resp.text
+        except Exception:
+            return "<unable to read response body>"
+
 
 def _seconds_until_any_key_available(now: float) -> float:
     waits = []
