@@ -735,11 +735,59 @@ def _seconds_until_any_key_available(now: float) -> float:
     return min(waits) if waits else 0.0
 
 
-def _truncate(s: str, n: int = 400) -> str:
+def _truncate(s: str, n: int = 300) -> str:
     if not isinstance(s, str):
         return ""
     s = s.replace("\n", "\\n")
     return s[:n] + ("…" if len(s) > n else "")
+
+def _summarize_openrouter_data(data: Any) -> dict:
+    """
+    Resumen seguro y chico (para logs) del response de OpenRouter.
+    No loguea contenido completo ni metadata gigante.
+    """
+    if not isinstance(data, dict):
+        return {"type": type(data).__name__}
+
+    summary: Dict[str, Any] = {
+        "keys": list(data.keys())[:25],
+        "model": data.get("model"),
+    }
+
+    choices = data.get("choices")
+    if isinstance(choices, list):
+        summary["choices_len"] = len(choices)
+        if choices:
+            c0 = choices[0] if isinstance(choices[0], dict) else {}
+            msg = c0.get("message") if isinstance(c0.get("message"), dict) else None
+            if msg is None and isinstance(c0.get("delta"), dict):
+                msg = c0.get("delta")
+
+            raw_content = None
+            if isinstance(msg, dict):
+                raw_content = msg.get("content")
+
+            summary["choice0_keys"] = list(c0.keys())[:25]
+            summary["raw_content_type"] = type(raw_content).__name__
+
+            # preview del texto parseado (sin romper si falla)
+            try:
+                parsed = extract_text_content(data)
+                summary["parsed_len"] = len(parsed or "")
+                summary["parsed_preview"] = _truncate(parsed or "", 250)
+            except Exception as e:
+                summary["parsed_error"] = str(e)[:200]
+
+    # Si viene error embebido
+    err = data.get("error")
+    if isinstance(err, dict):
+        summary["error"] = {
+            "code": err.get("code"),
+            "message": _truncate(str(err.get("message") or ""), 250),
+        }
+
+    return summary
+
 
 def extract_used_model(data: dict, fallback: str = "unknown") -> str:
     if not isinstance(data, dict):
@@ -847,9 +895,6 @@ async def chat(request: Request, req: AIChatRequest):
         payload["route"] = "fallback"
     if stable_user:
         payload["user"] = stable_user
-
-    logger.info("[/api/ai/chat] -> sending to OpenRouter | primary=%s fallbacks=%s user=%s",
-                models[0], models[1:], stable_user)
 
     data = await call_openrouter_best_effort(payload, request)
     try:
