@@ -301,6 +301,58 @@ def _backoff_seconds(attempt_idx: int, base: float = 1.0, cap: float = 12.0) -> 
     return t * (0.75 + random.random() * 0.5)
 
 
+def _openrouter_any_error(data: Any) -> Optional[Dict[str, Any]]:
+    """
+    OpenRouter a veces responde HTTP 200 pero con error:
+      - error top-level: {"error": {...}}
+      - error dentro de choices[0]: {"choices":[{"error": {...}, ...}]}
+      - error dentro de choices[0].message: {"choices":[{"message":{"error": {...}}}]}
+    Retorna dict normalizado: {where, code, message, metadata, raw}
+    """
+    if not isinstance(data, dict):
+        return None
+
+    # 1) Top-level error
+    err = data.get("error")
+    if isinstance(err, dict) and (err.get("message") or err.get("code") is not None):
+        return {
+            "where": "top_level",
+            "code": err.get("code"),
+            "message": err.get("message") or "",
+            "metadata": err.get("metadata"),
+            "raw": err,
+        }
+
+    # 2) choices-level
+    choices = data.get("choices")
+    if isinstance(choices, list) and choices:
+        c0 = choices[0] if isinstance(choices[0], dict) else {}
+
+        c0_err = c0.get("error")
+        if isinstance(c0_err, dict) and (c0_err.get("message") or c0_err.get("code") is not None):
+            return {
+                "where": "choices[0].error",
+                "code": c0_err.get("code"),
+                "message": c0_err.get("message") or "",
+                "metadata": c0_err.get("metadata"),
+                "raw": c0_err,
+            }
+
+        msg = c0.get("message")
+        if isinstance(msg, dict):
+            msg_err = msg.get("error")
+            if isinstance(msg_err, dict) and (msg_err.get("message") or msg_err.get("code") is not None):
+                return {
+                    "where": "choices[0].message.error",
+                    "code": msg_err.get("code"),
+                    "message": msg_err.get("message") or "",
+                    "metadata": msg_err.get("metadata"),
+                    "raw": msg_err,
+                }
+
+    return None
+
+
 async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request) -> Dict[str, Any]:
     """
     Best-effort OpenRouter call with:
@@ -308,7 +360,7 @@ async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request)
       - GLOBAL + per-key RPM throttle for :free
       - concurrency limit
       - retries with real backoff (1s+)
-      - handles HTTP 200 with {error: ...} body
+      - handles HTTP 200 with embedded errors
       - per-model cooldown to avoid hammering failing models
     """
     await _ensure_openrouter_initialized()
@@ -318,7 +370,6 @@ async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request)
     deadline = time.monotonic() + OPENROUTER_MAX_TOTAL_WAIT_S
     last_err: Any = None
 
-    # evita reintentos ultra seguidos aunque no haya 429
     MIN_RETRY_GAP_S = 1.0
 
     for attempt in range(OPENROUTER_MAX_ATTEMPTS):
@@ -340,14 +391,12 @@ async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request)
 
         used_model = payload2.get("model") if isinstance(payload2.get("model"), str) else None
 
-        # 2) elige key disponible
         api_key = await _pick_key_round_robin(now_epoch)
         if not api_key:
             wait_k = _seconds_until_any_key_available(time.time())
             await asyncio.sleep(min(1.0, wait_k) if wait_k > 0 else 0.5)
             continue
 
-        # 3) rate limit para :free (GLOBAL + per-key)
         if _payload_uses_free_models(payload2):
             await _free_global_limiter.acquire()
             await _limiter_for_key(api_key).acquire()
@@ -361,13 +410,14 @@ async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request)
                 payload2.get("route"),
                 payload2.get("user"),
             )
-            logger.info("payload_check: model=%s n_messages=%d roles=%s first_len=%s last_len=%s",
-            payload2.get("model"),
-            len(payload2.get("messages") or []),
-            [m.get("role") for m in (payload2.get("messages") or [])[:3]],
-            len(((payload2.get("messages") or [{}])[0].get("content") or "")),
-            len(((payload2.get("messages") or [{}])[-1].get("content") or "")))
-
+            logger.info(
+                "payload_check: model=%s n_messages=%d roles=%s first_len=%s last_len=%s",
+                payload2.get("model"),
+                len(payload2.get("messages") or []),
+                [m.get("role") for m in (payload2.get("messages") or [])[:3]],
+                len(((payload2.get("messages") or [{}])[0].get("content") or "")),
+                len(((payload2.get("messages") or [{}])[-1].get("content") or "")),
+            )
 
             async with _openrouter_sem:
                 resp = await _openrouter_post_with_key(payload2, request, api_key)
@@ -388,66 +438,93 @@ async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request)
             await asyncio.sleep(_backoff_seconds(attempt, base=MIN_RETRY_GAP_S))
             continue
 
-        # helper: sleep respetando deadline
         async def _sleep_cap(s: float):
             remaining = max(0.0, deadline - time.monotonic())
             await asyncio.sleep(min(s, remaining))
 
-        # 5) HTTP 200 (puede traer error en body)
+        # 5) HTTP 200 (puede traer error embebido)
         if resp.status_code == 200:
             data = safe_json(resp)
             logger.info("[openrouter] 200 received summary=%s", _summarize_openrouter_data(data))
 
-            body_err = _openrouter_body_error(data)
-            if body_err:
-                code = _normalize_error_code(body_err.get("code"), 500)
-                err_msg = str(body_err.get("message") or "")
+            or_err = _openrouter_any_error(data)
+            if or_err:
+                code = _normalize_error_code(or_err.get("code"), 500)
+                err_msg = str(or_err.get("message") or "")
                 ra = _retry_after_seconds(resp)
 
-                # 429 en body
+                logger.warning(
+                    "[openrouter] embedded error detected where=%s code=%s msg=%s meta=%s",
+                    or_err.get("where"),
+                    code,
+                    _truncate(err_msg, 300),
+                    _truncate(str(or_err.get("metadata")), 500),
+                )
+
                 if code == 429:
                     wait_s = ra if ra > 0 else _backoff_seconds(attempt, base=2.0, cap=20.0)
                     _mark_cooldown(api_key, wait_s)
                     if used_model:
                         _mark_model_cooldown(used_model, max(10.0, wait_s))
-                    last_err = {"type": "429_body", "wait": wait_s, "msg": err_msg, "key": _mask_key(api_key)}
+                    last_err = {
+                        "type": "429_body",
+                        "wait": wait_s,
+                        "msg": err_msg,
+                        "key": _mask_key(api_key),
+                        "where": or_err.get("where"),
+                    }
                     await _sleep_cap(wait_s)
                     continue
 
-                # 402 provider error (en free pasa MUCHO) => enfriar modelo más tiempo
                 if code == 402:
                     if used_model:
-                        _mark_model_cooldown(used_model, 60.0)   # clave: NO martillar
+                        _mark_model_cooldown(used_model, 60.0)
                     _mark_cooldown(api_key, 5.0)
-                    last_err = {"type": "402_body", "msg": err_msg, "key": _mask_key(api_key), "body_error": body_err}
+                    last_err = {
+                        "type": "402_body",
+                        "msg": err_msg,
+                        "key": _mask_key(api_key),
+                        "where": or_err.get("where"),
+                        "metadata": or_err.get("metadata"),
+                    }
                     await _sleep_cap(_backoff_seconds(attempt, base=2.0, cap=15.0))
                     continue
 
-                # 5xx en body
                 if 500 <= code <= 599:
                     if used_model:
                         _mark_model_cooldown(used_model, 20.0)
                     _mark_cooldown(api_key, 3.0)
-                    last_err = {"type": "5xx_body", "status": code, "msg": err_msg, "key": _mask_key(api_key)}
+                    last_err = {
+                        "type": "5xx_body",
+                        "status": code,
+                        "msg": err_msg,
+                        "key": _mask_key(api_key),
+                        "where": or_err.get("where"),
+                        "metadata": or_err.get("metadata"),
+                    }
                     await _sleep_cap(_backoff_seconds(attempt, base=2.0, cap=15.0))
                     continue
 
-                # request inválida
                 if code in (400, 422):
                     raise HTTPException(
                         status_code=400,
-                        detail={"error": {"message": err_msg, "payload_hint": "Invalid request to OpenRouter", "body_error": body_err}},
+                        detail={"error": {"message": err_msg, "where": or_err.get("where"), "metadata": or_err.get("metadata")}},
                     )
 
                 _mark_cooldown(api_key, 5.0)
-                last_err = {"type": "4xx_body", "status": code, "msg": err_msg, "key": _mask_key(api_key)}
+                last_err = {
+                    "type": "4xx_body",
+                    "status": code,
+                    "msg": err_msg,
+                    "key": _mask_key(api_key),
+                    "where": or_err.get("where"),
+                }
                 await _sleep_cap(_backoff_seconds(attempt, base=2.0, cap=12.0))
                 continue
 
             # success body: parse content
             content = extract_text_content(data)
             if not (content or "").strip():
-                # content vacío => transitorio, enfría modelo y espera más
                 _mark_cooldown(api_key, 3.0)
                 if used_model:
                     _mark_model_cooldown(used_model, 20.0)
@@ -509,7 +586,6 @@ async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request)
         status_code=503,
         detail={"error": {"message": "OpenRouter unavailable", "last": last_err}},
     )
-
 app = FastAPI()
 
 raw_patterns = [p.strip() for p in os.getenv("VARIAMOS_CORS_ALLOWED_ORIGINS_PATTERNS", "").split(",") if p.strip()]
@@ -883,6 +959,19 @@ def _summarize_openrouter_data(data: Any) -> dict:
             raw_content = None
             if isinstance(msg, dict):
                 raw_content = msg.get("content")
+                # Choice-level error
+            if isinstance(choices, list) and choices:
+                c0 = choices[0] if isinstance(choices[0], dict) else {}
+                c0err = c0.get("error")
+                if isinstance(c0err, dict):
+                    summary["choice0_error"] = {
+                        "code": c0err.get("code"),
+                        "message": _truncate(str(c0err.get("message") or ""), 250),
+                    }
+                    meta = c0err.get("metadata")
+                    if meta is not None:
+                        summary["choice0_error_meta_preview"] = _truncate(str(meta), 400)
+
 
             summary["choice0_keys"] = list(c0.keys())[:25]
             summary["raw_content_type"] = type(raw_content).__name__
