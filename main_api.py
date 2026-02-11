@@ -38,6 +38,11 @@ handler.setFormatter(formatter)
 
 logging.basicConfig(level=logging.DEBUG, handlers=[handler])
 logger = logging.getLogger(__name__)
+logging.getLogger().setLevel(logging.INFO)
+
+for noisy in ("httpx", "httpcore", "hpack", "h2"):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
+logger.setLevel(logging.INFO)
 
 class ShareProjectInput(BaseModel):
     user_email: str
@@ -280,7 +285,7 @@ async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request)
         # =========================
         if resp.status_code == 200:
             data = safe_json(resp)
-
+            logger.info("[openrouter] 200 received summary=%s", _summarize_openrouter_data(data))
             body_err = _openrouter_body_error(data)  # <- debe devolver dict o None
             if body_err:
                 code = _normalize_error_code(body_err.get("code"), 500)
@@ -759,55 +764,61 @@ def extract_used_model(data: dict, fallback: str = "unknown") -> str:
 
 def extract_text_content(data: dict) -> str:
     if not isinstance(data, dict):
+        logger.warning("[openrouter] data is not dict: %s", type(data))
         return ""
 
-    choices = data.get("choices")
+    choices = data.get("choices") or []
     if not isinstance(choices, list) or not choices:
-        # Algunas respuestas podrían usar "output_text" u otros campos
         ot = data.get("output_text")
-        return ot.strip() if isinstance(ot, str) else ""
+        if isinstance(ot, str) and ot.strip():
+            return ot.strip()
 
-    ch0 = choices[0] if isinstance(choices[0], dict) else {}
+        logger.warning("[openrouter] no choices. keys=%s", sorted(list(data.keys()))[:30])
+        return ""
 
-    msg = ch0.get("message") if isinstance(ch0.get("message"), dict) else {}
+    c0 = choices[0] if isinstance(choices[0], dict) else {}
+    # OpenAI-style
+    msg = c0.get("message")
+    if msg is None:
+        msg = c0.get("delta")
+
+    if msg is None:
+        txt = c0.get("text")
+        if isinstance(txt, str) and txt.strip():
+            return txt.strip()
+        msg = {}
+
+    # msg debería ser dict
+    if not isinstance(msg, dict):
+        logger.warning("[openrouter] message/delta not dict. type=%s", type(msg))
+        return ""
+
     c = msg.get("content")
 
-    # 1) content string
+    # Caso normal: string
     if isinstance(c, str):
         return c.strip()
 
+    # Caso: lista de partes [{type:"text", text:"..."}]
     if isinstance(c, list):
         parts = []
         for item in c:
-            if not isinstance(item, dict):
-                continue
-            # variantes típicas: {"type":"text","text":"..."} o {"type":"output_text","text":"..."}
-            t = item.get("text")
-            if isinstance(t, str) and t.strip():
-                parts.append(t.strip())
-            t2 = item.get("content")
-            if isinstance(t2, str) and t2.strip():
-                parts.append(t2.strip())
+            if isinstance(item, dict):
+                t = item.get("text")
+                if isinstance(t, str) and t.strip():
+                    parts.append(t.strip())
         return "\n".join(parts).strip()
 
+    # Caso: dict con text
     if isinstance(c, dict):
         t = c.get("text")
         if isinstance(t, str) and t.strip():
             return t.strip()
-        # algunas variantes usan {"content":"..."}
-        t2 = c.get("content")
-        if isinstance(t2, str) and t2.strip():
-            return t2.strip()
 
-    t = ch0.get("text")
-    if isinstance(t, str) and t.strip():
-        return t.strip()
-
-    delta = ch0.get("delta")
-    if isinstance(delta, dict):
-        dc = delta.get("content")
-        if isinstance(dc, str) and dc.strip():
-            return dc.strip()
+    # Caso: algunos devuelven output_text
+    ot = data.get("output_text")
+    if isinstance(ot, str) and ot.strip():
+        return ot.strip()
 
     return ""
 
@@ -815,6 +826,13 @@ def extract_text_content(data: dict) -> str:
 async def chat(request: Request, req: AIChatRequest):
     models = [req.primaryModelId] + [m for m in req.fallbackModelIds if m and m != req.primaryModelId]
     models = models[:3]
+
+    logger.info(
+        "[/api/ai/chat] -> sending to OpenRouter | primary=%s fallbacks=%s user=%s",
+        models[0],
+        models[1:],
+        getattr(getattr(request.state, "user", None), "id", None),
+    )
 
     user_obj = getattr(getattr(request, "state", None), "user", None)
     stable_user = str(user_obj.id) if user_obj and getattr(user_obj, "id", None) else None
@@ -844,6 +862,8 @@ async def chat(request: Request, req: AIChatRequest):
 
     content = extract_text_content(data)
     used_model = extract_used_model(data, fallback=(models[0] if models else "unknown"))
+
+    logger.info("[/api/ai/chat] <- returning to front | used_model=%s content_len=%d", used_model, len(content or ""))
 
     try:
         ch0 = (data.get("choices") or [{}])[0] if isinstance(data, dict) else {}
