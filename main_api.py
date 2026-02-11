@@ -415,10 +415,10 @@ async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request)
             if resp.status_code == 429:
                 wait_s = _retry_after_seconds(resp) or 8.0
                 _mark_cooldown(api_key, wait_s)
-                last_exc = HTTPException(
+                raise HTTPException(
                     status_code=429,
-                    detail={"error": {"message": msg or "Rate limited by OpenRouter"}},
-                    headers={"Retry-After": str(int(wait_s))},
+                    detail={"error": {"message": msg, "retryAfter": wait_s}},
+                    headers={"Retry-After": str(int(wait_s))}
                 )
                 continue
 
