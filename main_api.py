@@ -292,8 +292,8 @@ def _candidate_models(payload: Dict[str, Any]) -> List[str]:
     m = payload.get("model")
     return [m] if isinstance(m, str) else []
     
-    
-_free_global_limiter = SlidingWindowRateLimiter(OPENROUTER_FREE_GLOBAL_RPM, 60.0)
+
+
 
 def _backoff_seconds(attempt_idx: int, base: float = 1.0, cap: float = 12.0) -> float:
     t = min(cap, base * (2 ** attempt_idx))
@@ -782,6 +782,7 @@ class SlidingWindowRateLimiter:
             await asyncio.sleep(max(0.0, wait_s))
 
 _free_rpm_limiters: Dict[str, SlidingWindowRateLimiter] = {}
+_free_global_limiter = SlidingWindowRateLimiter(OPENROUTER_FREE_GLOBAL_RPM, 60.0)
 
 def _limiter_for_key(api_key: str) -> SlidingWindowRateLimiter:
     lim = _free_rpm_limiters.get(api_key)
