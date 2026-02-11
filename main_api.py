@@ -4,6 +4,7 @@ import logging
 from fastapi import FastAPI, Depends, HTTPException, Request, APIRouter
 from sqlalchemy.orm import Session
 from uvicorn.logging import DefaultFormatter
+from starlette.requests import Request as StarletteRequest
 
 from variamos_security import (load_keys, is_authenticated, has_roles, has_permissions, SessionUser, VariamosSecurityException, variamos_security_exception_handler)
 
@@ -73,6 +74,8 @@ _openrouter_keys: List[str] = []
 _openrouter_key_state: Dict[str, Dict[str, Any]] = {}  # {key: {"cooldown_until": float, "disabled_until": float}}
 _openrouter_last_idx: int = 0
 _openrouter_client: Optional[httpx.AsyncClient] = None
+_openrouter_model_state: Dict[str, float] = {} 
+_model_lock = asyncio.Lock()
 
 def _load_openrouter_keys() -> List[str]:
     raw = (os.getenv("VARIAMOS_OPENROUTER_API_KEYS")
@@ -150,6 +153,15 @@ def _retry_after_seconds(resp: httpx.Response) -> float:
     except Exception:
         return 0.0
 
+
+def _model_available(model: str, now: float) -> bool:
+    until = _openrouter_model_state.get(model, 0.0)
+    return now >= until
+
+def _mark_model_cooldown(model: str, seconds: float):
+    now = time.time()
+    _openrouter_model_state[model] = max(_openrouter_model_state.get(model, 0.0), now + max(0.0, seconds))
+
 def _build_openrouter_headers(request: Request, api_key: str) -> Dict[str, str]:
     referer = (request.headers.get("origin") or "https://app.variamos.com")
     title = "VariaMos"
@@ -204,6 +216,7 @@ def _as_int(x: Any, default: int) -> int:
         return int(x)
     except Exception:
         return default
+    
 def _normalize_error_code(code: Any, default: int = 500) -> int:
     if code is None:
         return default
@@ -227,6 +240,52 @@ def _normalize_error_code(code: Any, default: int = 500) -> int:
     return default
 
 
+async def _client_gone(request: StarletteRequest) -> bool:
+    try:
+        return await request.is_disconnected()
+    except Exception:
+        return False
+    
+def _filter_models_by_availability(payload: Dict[str, Any], now: float) -> Dict[str, Any]:
+    # construye lista candidata
+    candidates: List[str] = []
+    if isinstance(payload.get("models"), list):
+        candidates = [m for m in payload["models"] if isinstance(m, str)]
+    elif isinstance(payload.get("model"), str):
+        candidates = [payload["model"]]
+
+    # filtra por cooldown
+    available = [m for m in candidates if _model_available(m, now)]
+    if not available:
+        return {}
+
+    # reconstruye payload consistente
+    p2 = dict(payload)
+    p2["model"] = available[0]
+    if len(available) > 1:
+        p2["models"] = available
+        p2["route"] = "fallback"
+    else:
+        p2.pop("models", None)
+        p2.pop("route", None)
+    return p2
+
+
+def _seconds_until_any_model_available(payload: Dict[str, Any], now: float) -> float:
+    candidates: List[str] = []
+    if isinstance(payload.get("models"), list):
+        candidates = [m for m in payload["models"] if isinstance(m, str)]
+    elif isinstance(payload.get("model"), str):
+        candidates = [payload["model"]]
+
+    waits = []
+    for m in candidates:
+        until = _openrouter_model_state.get(m, 0.0)
+        if until > now:
+            waits.append(until - now)
+    return min(waits) if waits else 0.0
+
+    
 async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request) -> Dict[str, Any]:
     """
     1) NO hace fan-out por modelos: manda 1 request con `models` (fallback server-side)
@@ -243,10 +302,22 @@ async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request)
     last_err: Any = None
 
     for attempt in range(OPENROUTER_MAX_ATTEMPTS):
+        try:
+            if await _client_gone(request):
+                logger.warning("[openrouter] client disconnected -> aborting attempts")
+                raise HTTPException(status_code=499, detail="Client disconnected")
+        except Exception:
+            pass
+
         if time.monotonic() >= deadline:
             break
 
         now = time.time()
+        payload2 = _filter_models_by_availability(payload, now)
+        if not payload2:
+            wait_m = _seconds_until_any_model_available(payload, now)
+            await asyncio.sleep(min(0.5, wait_m) if wait_m > 0 else 0.25)
+            continue
         api_key = await _pick_key_round_robin(now)
 
         if not api_key:
@@ -258,7 +329,7 @@ async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request)
 
         # rate limit (especialmente para :free)
         if _payload_uses_free_models(payload):
-            await _free_rpm_limiter.acquire()
+            await _limiter_for_key(api_key).acquire()
 
         try:
             logger.info(
@@ -280,9 +351,6 @@ async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request)
             last_err = {"type": "network", "attempt": attempt + 1, "msg": str(e)}
             continue
 
-        # =========================
-        # Caso 200: puede venir error en el body
-        # =========================
         if resp.status_code == 200:
             data = safe_json(resp)
             logger.info("[openrouter] 200 received summary=%s", _summarize_openrouter_data(data))
@@ -297,7 +365,6 @@ async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request)
                     wait_s = ra if ra > 0 else 2.5
                     wait_s = wait_s * (0.75 + random.random() * 0.5)
 
-                    # ✅ SOLO la key que falló
                     _mark_cooldown(api_key, wait_s)
 
                     remaining = max(0.0, deadline - time.monotonic())
@@ -307,24 +374,25 @@ async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request)
 
 
                 if code == 402:
-                    _mark_disabled(api_key, 3600.0)
-                    last_err = {"type": "disabled_key", "status": 402, "msg": err_msg, "body_error": body_err}
+                    if isinstance(payload.get("model"), str):
+                        _mark_model_cooldown(payload["model"], 10.0)
+                    _mark_cooldown(api_key, 2.0)
+                    last_err = {"type": "402_provider", "msg": err_msg, "body_error": body_err}
                     continue
 
                 if 500 <= code <= 599:
-                    _mark_cooldown(api_key, 1.0 + attempt * 0.5)
-                    await asyncio.sleep(0.2 + random.random() * 0.3)
+                    if isinstance(payload.get("model"), str):
+                        _mark_model_cooldown(payload["model"], 5.0) 
+                    await asyncio.sleep(0.3 + random.random() * 0.3)
                     last_err = {"type": "5xx", "status": code, "msg": err_msg, "body_error": body_err}
                     continue
 
-                # otros códigos (400/422/etc) vienen como "error en body"
+                # otros códigos (400/422/etc)
                 if code in (400, 422):
                     raise HTTPException(
                         status_code=400,
                         detail={"error": {"message": err_msg, "payload_hint": "Invalid request to OpenRouter", "body_error": body_err}},
                     )
-
-                # resto: trátalo como 4xx genérico y reintenta con cooldown corto
                 _mark_cooldown(api_key, 2.0)
                 await asyncio.sleep(0.15 + random.random() * 0.2)
                 last_err = {"type": "4xx", "status": code, "msg": err_msg, "body_error": body_err}
@@ -349,7 +417,6 @@ async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request)
             wait_s = ra if ra > 0 else 2.5
             wait_s = wait_s * (0.75 + random.random() * 0.5)
 
-            # ✅ SOLO la key que falló
             _mark_cooldown(api_key, wait_s)
 
             remaining = max(0.0, deadline - time.monotonic())
@@ -678,7 +745,14 @@ class SlidingWindowRateLimiter:
 
             await asyncio.sleep(max(0.0, wait_s))
 
-_free_rpm_limiter = SlidingWindowRateLimiter(OPENROUTER_FREE_RPM, 60.0)
+_free_rpm_limiters: Dict[str, SlidingWindowRateLimiter] = {}
+
+def _limiter_for_key(api_key: str) -> SlidingWindowRateLimiter:
+    lim = _free_rpm_limiters.get(api_key)
+    if lim is None:
+        lim = SlidingWindowRateLimiter(OPENROUTER_FREE_RPM, 60.0)
+        _free_rpm_limiters[api_key] = lim
+    return lim
 
 def _payload_uses_free_models(payload: Dict[str, Any]) -> bool:
     ms = payload.get("models")
