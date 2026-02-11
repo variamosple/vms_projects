@@ -696,41 +696,6 @@ class AIChatResult(BaseModel):
     content: str
     usedModelId: str
 
-@router.post("/chat", response_model=AIChatResult)
-async def chat(request: Request, req: AIChatRequest):
-
-    models = [req.primaryModelId] + [m for m in req.fallbackModelIds if m and m != req.primaryModelId]
-    models = models[:3]
-
-    user_id = getattr(getattr(request, "state", None), "user", None)
-    stable_user = None
-    if user_id and getattr(user_id, "id", None):
-        stable_user = str(user_id.id)
-
-    payload = {
-        "model": models[0],                 
-        "messages": [m.model_dump() for m in req.messages],
-        "stream": False,
-    }
-
-    if len(models) > 1:
-        payload["models"] = models
-        payload["route"] = "fallback"
-
-    if stable_user:
-        payload["user"] = stable_user
-
-    data = await call_openrouter_best_effort(payload, request)
-
-    content = extract_text_content(data)
-    used_model = data.get("model") or (models[0] if models else "unknown")
-
-    if not content.strip():
-        raise HTTPException(status_code=502, detail={"error": "Empty content from OpenRouter", "usedModelId": used_model})
-
-    return {"content": content, "usedModelId": used_model}
-
-
 @router.get("/_debug/openrouter", dependencies=[Depends(is_authenticated)])
 async def debug_openrouter():
     await _ensure_openrouter_initialized()
@@ -764,32 +729,142 @@ def _seconds_until_any_key_available(now: float) -> float:
             waits.append(until - now)
     return min(waits) if waits else 0.0
 
-def extract_text_content(data: dict) -> str:
-    choices = data.get("choices") or []
-    if not choices:
-        return ""
-    msg = (choices[0].get("message") or {})
 
+def _truncate(s: str, n: int = 400) -> str:
+    if not isinstance(s, str):
+        return ""
+    s = s.replace("\n", "\\n")
+    return s[:n] + ("…" if len(s) > n else "")
+
+def extract_used_model(data: dict, fallback: str = "unknown") -> str:
+    if not isinstance(data, dict):
+        return fallback
+    m = data.get("model")
+    if isinstance(m, str) and m.strip():
+        return m.strip()
+
+    choices = data.get("choices")
+    if isinstance(choices, list) and choices:
+        ch0 = choices[0] if isinstance(choices[0], dict) else {}
+        m2 = ch0.get("model")
+        if isinstance(m2, str) and m2.strip():
+            return m2.strip()
+
+        msg = ch0.get("message") if isinstance(ch0.get("message"), dict) else {}
+        m3 = msg.get("model")
+        if isinstance(m3, str) and m3.strip():
+            return m3.strip()
+
+    return fallback
+
+def extract_text_content(data: dict) -> str:
+    if not isinstance(data, dict):
+        return ""
+
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        # Algunas respuestas podrían usar "output_text" u otros campos
+        ot = data.get("output_text")
+        return ot.strip() if isinstance(ot, str) else ""
+
+    ch0 = choices[0] if isinstance(choices[0], dict) else {}
+
+    msg = ch0.get("message") if isinstance(ch0.get("message"), dict) else {}
     c = msg.get("content")
 
+    # 1) content string
     if isinstance(c, str):
-        return c
+        return c.strip()
 
     if isinstance(c, list):
         parts = []
         for item in c:
-            if isinstance(item, dict):
-                if item.get("type") == "text" and isinstance(item.get("text"), str):
-                    parts.append(item["text"])
-                elif isinstance(item.get("text"), str):
-                    parts.append(item["text"])
+            if not isinstance(item, dict):
+                continue
+            # variantes típicas: {"type":"text","text":"..."} o {"type":"output_text","text":"..."}
+            t = item.get("text")
+            if isinstance(t, str) and t.strip():
+                parts.append(t.strip())
+            t2 = item.get("content")
+            if isinstance(t2, str) and t2.strip():
+                parts.append(t2.strip())
         return "\n".join(parts).strip()
 
-    # Some providers put text here
-    if isinstance(c, dict) and isinstance(c.get("text"), str):
-        return c["text"].strip()
+    if isinstance(c, dict):
+        t = c.get("text")
+        if isinstance(t, str) and t.strip():
+            return t.strip()
+        # algunas variantes usan {"content":"..."}
+        t2 = c.get("content")
+        if isinstance(t2, str) and t2.strip():
+            return t2.strip()
+
+    t = ch0.get("text")
+    if isinstance(t, str) and t.strip():
+        return t.strip()
+
+    delta = ch0.get("delta")
+    if isinstance(delta, dict):
+        dc = delta.get("content")
+        if isinstance(dc, str) and dc.strip():
+            return dc.strip()
 
     return ""
+
+@router.post("/chat", response_model=AIChatResult)
+async def chat(request: Request, req: AIChatRequest):
+    models = [req.primaryModelId] + [m for m in req.fallbackModelIds if m and m != req.primaryModelId]
+    models = models[:3]
+
+    user_obj = getattr(getattr(request, "state", None), "user", None)
+    stable_user = str(user_obj.id) if user_obj and getattr(user_obj, "id", None) else None
+
+    payload = {
+        "model": models[0],
+        "messages": [m.model_dump() for m in req.messages],
+        "stream": False,
+    }
+    if len(models) > 1:
+        payload["models"] = models
+        payload["route"] = "fallback"
+    if stable_user:
+        payload["user"] = stable_user
+
+    logger.info("[/api/ai/chat] -> sending to OpenRouter | primary=%s fallbacks=%s user=%s",
+                models[0], models[1:], stable_user)
+
+    data = await call_openrouter_best_effort(payload, request)
+    try:
+        keys = list(data.keys()) if isinstance(data, dict) else []
+        nchoices = len(data.get("choices") or []) if isinstance(data, dict) else 0
+        logger.info("[OpenRouter] <- response keys=%s choices=%s model(top)=%s",
+                    keys, nchoices, data.get("model") if isinstance(data, dict) else None)
+    except Exception:
+        logger.exception("[OpenRouter] log summary failed")
+
+    content = extract_text_content(data)
+    used_model = extract_used_model(data, fallback=(models[0] if models else "unknown"))
+
+    try:
+        ch0 = (data.get("choices") or [{}])[0] if isinstance(data, dict) else {}
+        msg = ch0.get("message") if isinstance(ch0, dict) else {}
+        raw_c = msg.get("content") if isinstance(msg, dict) else None
+        logger.info("[OpenRouter] parsed | used_model=%s | content_len=%s | raw_content_type=%s | preview=%s",
+                    used_model, len(content or ""), type(raw_c).__name__, _truncate(content, 300))
+    except Exception:
+        logger.exception("[OpenRouter] log parsed failed")
+
+    if not (content or "").strip():
+        try:
+            logger.error("[OpenRouter] EMPTY content after parsing | used_model=%s | data_preview=%s",
+                         used_model, _truncate(str(data), 800))
+        except Exception:
+            pass
+        raise HTTPException(status_code=502, detail={"error": "Empty content from OpenRouter", "usedModelId": used_model})
+
+    return {"content": content, "usedModelId": used_model}
+
+
 
 
 app.include_router(router)
