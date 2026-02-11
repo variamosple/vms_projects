@@ -292,15 +292,24 @@ def _candidate_models(payload: Dict[str, Any]) -> List[str]:
     m = payload.get("model")
     return [m] if isinstance(m, str) else []
     
+    
+_free_global_limiter = SlidingWindowRateLimiter(OPENROUTER_FREE_GLOBAL_RPM, 60.0)
+
+def _backoff_seconds(attempt_idx: int, base: float = 1.0, cap: float = 12.0) -> float:
+    t = min(cap, base * (2 ** attempt_idx))
+    # jitter +-25%
+    return t * (0.75 + random.random() * 0.5)
+
+
 async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request) -> Dict[str, Any]:
     """
     Best-effort OpenRouter call with:
-      1) Server-side fallback via `models` (NO fan-out from our side)
-      2) Per-key RPM throttle for :free models
-      3) Concurrency limit
-      4) Retries for 429/5xx/timeouts; rotate keys on 401/403/402
-      5) Handles "HTTP 200 but body has {error: ...}" (OpenRouter sometimes does this)
-      6) Optional per-model cooldown (avoid hammering a model that is failing)
+      - server-side fallback via `models` (NO fan-out here)
+      - GLOBAL + per-key RPM throttle for :free
+      - concurrency limit
+      - retries with real backoff (1s+)
+      - handles HTTP 200 with {error: ...} body
+      - per-model cooldown to avoid hammering failing models
     """
     await _ensure_openrouter_initialized()
     if not _openrouter_keys:
@@ -309,8 +318,10 @@ async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request)
     deadline = time.monotonic() + OPENROUTER_MAX_TOTAL_WAIT_S
     last_err: Any = None
 
+    # evita reintentos ultra seguidos aunque no haya 429
+    MIN_RETRY_GAP_S = 1.0
+
     for attempt in range(OPENROUTER_MAX_ATTEMPTS):
-        # client disconnected?
         if await _client_gone(request):
             logger.warning("[openrouter] client disconnected -> aborting attempts")
             raise HTTPException(status_code=499, detail="Client disconnected")
@@ -320,25 +331,28 @@ async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request)
 
         now_epoch = time.time()
 
-        # 1) filter out models in cooldown (if you use that feature)
+        # 1) filtra modelos en cooldown
         payload2 = _filter_models_by_availability(payload, now_epoch)
         if not payload2:
             wait_m = _seconds_until_any_model_available(payload, now_epoch)
-            await asyncio.sleep(min(0.5, wait_m) if wait_m > 0 else 0.25)
+            await asyncio.sleep(min(0.75, wait_m) if wait_m > 0 else 0.5)
             continue
 
-        # 2) pick an available key
+        used_model = payload2.get("model") if isinstance(payload2.get("model"), str) else None
+
+        # 2) elige key disponible
         api_key = await _pick_key_round_robin(now_epoch)
         if not api_key:
             wait_k = _seconds_until_any_key_available(time.time())
-            await asyncio.sleep(min(1.0, wait_k) if wait_k > 0 else 0.25)
+            await asyncio.sleep(min(1.0, wait_k) if wait_k > 0 else 0.5)
             continue
 
-        # 3) per-key RPM throttle for free models
+        # 3) rate limit para :free (GLOBAL + per-key)
         if _payload_uses_free_models(payload2):
+            await _free_global_limiter.acquire()
             await _limiter_for_key(api_key).acquire()
 
-        # 4) send request (bounded concurrency)
+        # 4) hace la request
         try:
             logger.info(
                 "OpenRouter payload: model=%s models=%s route=%s user=%s",
@@ -353,27 +367,27 @@ async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request)
                 resp = await _openrouter_post_with_key(payload2, request, api_key)
 
         except httpx.TimeoutException:
-            _mark_cooldown(api_key, 1.5)
+            _mark_cooldown(api_key, 2.0)
+            if used_model:
+                _mark_model_cooldown(used_model, 6.0)
             last_err = {"type": "timeout", "attempt": attempt + 1, "key": _mask_key(api_key)}
+            await asyncio.sleep(_backoff_seconds(attempt, base=MIN_RETRY_GAP_S))
             continue
 
         except httpx.RequestError as e:
-            _mark_cooldown(api_key, 1.5)
+            _mark_cooldown(api_key, 2.0)
+            if used_model:
+                _mark_model_cooldown(used_model, 6.0)
             last_err = {"type": "network", "attempt": attempt + 1, "msg": str(e), "key": _mask_key(api_key)}
+            await asyncio.sleep(_backoff_seconds(attempt, base=MIN_RETRY_GAP_S))
             continue
 
-        # helpers for jittered waits
-        def _sleep_jitter(base: float, cap_remaining: bool = True):
-            # jitter +-25%
-            w = base * (0.75 + random.random() * 0.5)
-            if cap_remaining:
-                remaining = max(0.0, deadline - time.monotonic())
-                return asyncio.sleep(min(w, remaining))
-            return asyncio.sleep(w)
+        # helper: sleep respetando deadline
+        async def _sleep_cap(s: float):
+            remaining = max(0.0, deadline - time.monotonic())
+            await asyncio.sleep(min(s, remaining))
 
-        used_model = payload2.get("model") if isinstance(payload2.get("model"), str) else None
-
-        # 5) HTTP 200 (may still contain error in body)
+        # 5) HTTP 200 (puede traer error en body)
         if resp.status_code == 200:
             data = safe_json(resp)
             logger.info("[openrouter] 200 received summary=%s", _summarize_openrouter_data(data))
@@ -384,93 +398,85 @@ async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request)
                 err_msg = str(body_err.get("message") or "")
                 ra = _retry_after_seconds(resp)
 
-                # Treat embedded error like real status
+                # 429 en body
                 if code == 429:
-                    wait_s = ra if ra > 0 else 2.5
+                    wait_s = ra if ra > 0 else _backoff_seconds(attempt, base=2.0, cap=20.0)
                     _mark_cooldown(api_key, wait_s)
-                    last_err = {
-                        "type": "429_body",
-                        "wait": wait_s,
-                        "msg": err_msg,
-                        "body_error": body_err,
-                        "key": _mask_key(api_key),
-                    }
-                    await _sleep_jitter(wait_s)
-                    continue
-
-                if code == 402:
-                    # Provider-side issue (often "Provider returned error" even on free models)
                     if used_model:
-                        _mark_model_cooldown(used_model, 15.0)  # backoff a bit more
-                    _mark_cooldown(api_key, 2.0)
-                    last_err = {"type": "402_body", "msg": err_msg, "body_error": body_err, "key": _mask_key(api_key)}
-                    await _sleep_jitter(0.4)
+                        _mark_model_cooldown(used_model, max(10.0, wait_s))
+                    last_err = {"type": "429_body", "wait": wait_s, "msg": err_msg, "key": _mask_key(api_key)}
+                    await _sleep_cap(wait_s)
                     continue
 
+                # 402 provider error (en free pasa MUCHO) => enfriar modelo más tiempo
+                if code == 402:
+                    if used_model:
+                        _mark_model_cooldown(used_model, 60.0)   # clave: NO martillar
+                    _mark_cooldown(api_key, 5.0)
+                    last_err = {"type": "402_body", "msg": err_msg, "key": _mask_key(api_key), "body_error": body_err}
+                    await _sleep_cap(_backoff_seconds(attempt, base=2.0, cap=15.0))
+                    continue
+
+                # 5xx en body
                 if 500 <= code <= 599:
                     if used_model:
-                        _mark_model_cooldown(used_model, 8.0)
-                    _mark_cooldown(api_key, 1.0)
-                    last_err = {"type": "5xx_body", "status": code, "msg": err_msg, "body_error": body_err}
-                    await _sleep_jitter(0.4)
+                        _mark_model_cooldown(used_model, 20.0)
+                    _mark_cooldown(api_key, 3.0)
+                    last_err = {"type": "5xx_body", "status": code, "msg": err_msg, "key": _mask_key(api_key)}
+                    await _sleep_cap(_backoff_seconds(attempt, base=2.0, cap=15.0))
                     continue
 
-                # 4xx request errors (don’t retry much)
+                # request inválida
                 if code in (400, 422):
                     raise HTTPException(
                         status_code=400,
-                        detail={
-                            "error": {
-                                "message": err_msg,
-                                "payload_hint": "Invalid request to OpenRouter",
-                                "body_error": body_err,
-                            }
-                        },
+                        detail={"error": {"message": err_msg, "payload_hint": "Invalid request to OpenRouter", "body_error": body_err}},
                     )
 
-                _mark_cooldown(api_key, 2.0)
-                last_err = {"type": "4xx_body", "status": code, "msg": err_msg, "body_error": body_err}
-                await _sleep_jitter(0.3)
+                _mark_cooldown(api_key, 5.0)
+                last_err = {"type": "4xx_body", "status": code, "msg": err_msg, "key": _mask_key(api_key)}
+                await _sleep_cap(_backoff_seconds(attempt, base=2.0, cap=12.0))
                 continue
 
-            # success body
+            # success body: parse content
             content = extract_text_content(data)
             if not (content or "").strip():
-                _mark_cooldown(api_key, 1.0)
+                # content vacío => transitorio, enfría modelo y espera más
+                _mark_cooldown(api_key, 3.0)
+                if used_model:
+                    _mark_model_cooldown(used_model, 20.0)
                 last_err = {"type": "no_content", "attempt": attempt + 1, "used_model": data.get("model")}
-                await _sleep_jitter(0.3)
+                await _sleep_cap(_backoff_seconds(attempt, base=2.0, cap=12.0))
                 continue
 
             return data
 
-        # 6) Non-200 statuses
+        # 6) Non-200
         body = safe_json(resp)
-        if isinstance(body, dict):
-            err_msg = str((body.get("error") or {}).get("message") or "")
-        else:
-            err_msg = str(body)[:300]
+        err_msg = str((body.get("error") or {}).get("message") or "") if isinstance(body, dict) else str(body)[:300]
 
         if resp.status_code == 429:
             ra = _retry_after_seconds(resp)
-            wait_s = ra if ra > 0 else 2.5
+            wait_s = ra if ra > 0 else _backoff_seconds(attempt, base=2.0, cap=20.0)
             _mark_cooldown(api_key, wait_s)
+            if used_model:
+                _mark_model_cooldown(used_model, max(10.0, wait_s))
             last_err = {"type": "429", "wait": wait_s, "msg": err_msg, "key": _mask_key(api_key)}
-            await _sleep_jitter(wait_s)
+            await _sleep_cap(wait_s)
             continue
 
         if 500 <= resp.status_code <= 599:
+            _mark_cooldown(api_key, 3.0)
             if used_model:
-                _mark_model_cooldown(used_model, 6.0)
-            _mark_cooldown(api_key, 1.0 + attempt * 0.5)
+                _mark_model_cooldown(used_model, 20.0)
             last_err = {"type": "5xx", "status": resp.status_code, "msg": err_msg, "key": _mask_key(api_key)}
-            await _sleep_jitter(0.4)
+            await _sleep_cap(_backoff_seconds(attempt, base=2.0, cap=15.0))
             continue
 
         if resp.status_code in (401, 403, 402):
-            # disable key for a while; try another
-            _mark_disabled(api_key, 60.0)
+            _mark_disabled(api_key, 120.0)
             last_err = {"type": "disabled_key", "status": resp.status_code, "msg": err_msg, "key": _mask_key(api_key)}
-            await _sleep_jitter(0.2)
+            await _sleep_cap(_backoff_seconds(attempt, base=2.0, cap=12.0))
             continue
 
         if resp.status_code in (400, 422):
@@ -479,24 +485,18 @@ async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request)
                 detail={"error": {"message": err_msg, "payload_hint": "Invalid request to OpenRouter"}},
             )
 
-        _mark_cooldown(api_key, 2.0)
+        _mark_cooldown(api_key, 5.0)
         last_err = {"type": "4xx", "status": resp.status_code, "msg": err_msg, "key": _mask_key(api_key)}
-        await _sleep_jitter(0.3)
+        await _sleep_cap(_backoff_seconds(attempt, base=2.0, cap=12.0))
         continue
 
-    # exhausted retries / deadline
+    # exhausted
     if isinstance(last_err, dict) and last_err.get("type") in ("429", "429_body"):
-        retry = int(last_err.get("wait", 5) or 5)
+        retry = int(last_err.get("wait", 10) or 10)
         raise HTTPException(
             status_code=429,
             detail={"error": {"message": "Rate limited by OpenRouter", "last": last_err}},
             headers={"Retry-After": str(retry)},
-        )
-
-    if isinstance(last_err, dict) and last_err.get("type") in ("disabled_key",) and last_err.get("status") == 402:
-        raise HTTPException(
-            status_code=402,
-            detail={"error": {"message": "OpenRouter: insufficient credits (402). Add credits and retry.", "last": last_err}},
         )
 
     raise HTTPException(
@@ -748,10 +748,12 @@ def apply_configuration(project_id : str, config_input: ConfigurationInput2):
 
 from collections import deque
 
-OPENROUTER_FREE_RPM = 20
-OPENROUTER_MAX_CONCURRENCY = 5
-OPENROUTER_MAX_TOTAL_WAIT_S = 60  # < 30s front (si no usas streaming)
-OPENROUTER_MAX_ATTEMPTS = 6
+OPENROUTER_MAX_CONCURRENCY = 3   
+OPENROUTER_MAX_ATTEMPTS = 1      
+OPENROUTER_MAX_TOTAL_WAIT_S = 60 
+OPENROUTER_FREE_RPM = 10         
+OPENROUTER_FREE_GLOBAL_RPM = 20  
+
 
 _openrouter_sem = asyncio.Semaphore(OPENROUTER_MAX_CONCURRENCY)
 _openrouter_rr_lock = asyncio.Lock()
