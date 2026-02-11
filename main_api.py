@@ -355,237 +355,86 @@ def _openrouter_any_error(data: Any) -> Optional[Dict[str, Any]]:
 
 async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request) -> Dict[str, Any]:
     """
-    Best-effort OpenRouter call with:
-      - server-side fallback via `models` (NO fan-out here)
-      - GLOBAL + per-key RPM throttle for :free
-      - concurrency limit
-      - retries with real backoff (1s+)
-      - handles HTTP 200 with embedded errors
-      - per-model cooldown to avoid hammering failing models
+    PROXY LIMPIO (sin fallback interno):
+      - 1 request a OpenRouter
+      - 1 modelo por request (NO 'models', NO 'route')
+      - si falla, devuelve error claro al front para que el front haga fallback
     """
     await _ensure_openrouter_initialized()
     if not _openrouter_keys:
         raise HTTPException(status_code=500, detail="No OpenRouter API keys configured")
 
-    deadline = time.monotonic() + OPENROUTER_MAX_TOTAL_WAIT_S
-    last_err: Any = None
+    now_epoch = time.time()
 
-    MIN_RETRY_GAP_S = 1.0
+    api_key = await _pick_key_round_robin(now_epoch)
+    if not api_key:
+        raise HTTPException(status_code=503, detail={"error": {"message": "No API key available"}})
 
-    for attempt in range(OPENROUTER_MAX_ATTEMPTS):
-        if await _client_gone(request):
-            logger.warning("[openrouter] client disconnected -> aborting attempts")
-            raise HTTPException(status_code=499, detail="Client disconnected")
+    model = payload.get("model")
+    if not isinstance(model, str) or not model.strip():
+        raise HTTPException(status_code=400, detail={"error": {"message": "Missing 'model' in payload"}})
 
-        if time.monotonic() >= deadline:
-            break
+    payload2 = {
+        "model": model,
+        "messages": payload.get("messages") or [],
+        "stream": False,
+    }
+    # opcional: user estable
+    if isinstance(payload.get("user"), str) and payload["user"].strip():
+        payload2["user"] = payload["user"].strip()
 
-        now_epoch = time.time()
+    try:
+        resp = await _openrouter_post_with_key(payload2, request, api_key)
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail={"error": {"message": "OpenRouter timeout"}})
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=502, detail={"error": {"message": f"Network error: {str(e)}"}})
 
-        # 1) filtra modelos en cooldown
-        payload2 = _filter_models_by_availability(payload, now_epoch)
-        if not payload2:
-            wait_m = _seconds_until_any_model_available(payload, now_epoch)
-            await asyncio.sleep(min(0.75, wait_m) if wait_m > 0 else 0.5)
-            continue
-
-        used_model = payload2.get("model") if isinstance(payload2.get("model"), str) else None
-
-        api_key = await _pick_key_round_robin(now_epoch)
-        if not api_key:
-            wait_k = _seconds_until_any_key_available(time.time())
-            await asyncio.sleep(min(1.0, wait_k) if wait_k > 0 else 0.5)
-            continue
-
-        if _payload_uses_free_models(payload2):
-            await _free_global_limiter.acquire()
-            await _limiter_for_key(api_key).acquire()
-
-        # 4) hace la request
-        try:
-            logger.info(
-                "OpenRouter payload: model=%s models=%s route=%s user=%s",
-                payload2.get("model"),
-                payload2.get("models"),
-                payload2.get("route"),
-                payload2.get("user"),
-            )
-            logger.info(
-                "payload_check: model=%s n_messages=%d roles=%s first_len=%s last_len=%s",
-                payload2.get("model"),
-                len(payload2.get("messages") or []),
-                [m.get("role") for m in (payload2.get("messages") or [])[:3]],
-                len(((payload2.get("messages") or [{}])[0].get("content") or "")),
-                len(((payload2.get("messages") or [{}])[-1].get("content") or "")),
-            )
-
-            async with _openrouter_sem:
-                resp = await _openrouter_post_with_key(payload2, request, api_key)
-
-        except httpx.TimeoutException:
-            _mark_cooldown(api_key, 2.0)
-            if used_model:
-                _mark_model_cooldown(used_model, 6.0)
-            last_err = {"type": "timeout", "attempt": attempt + 1, "key": _mask_key(api_key)}
-            await asyncio.sleep(_backoff_seconds(attempt, base=MIN_RETRY_GAP_S))
-            continue
-
-        except httpx.RequestError as e:
-            _mark_cooldown(api_key, 2.0)
-            if used_model:
-                _mark_model_cooldown(used_model, 6.0)
-            last_err = {"type": "network", "attempt": attempt + 1, "msg": str(e), "key": _mask_key(api_key)}
-            await asyncio.sleep(_backoff_seconds(attempt, base=MIN_RETRY_GAP_S))
-            continue
-
-        async def _sleep_cap(s: float):
-            remaining = max(0.0, deadline - time.monotonic())
-            await asyncio.sleep(min(s, remaining))
-
-        # 5) HTTP 200 (puede traer error embebido)
-        if resp.status_code == 200:
-            data = safe_json(resp)
-            logger.info("[openrouter] 200 received summary=%s", _summarize_openrouter_data(data))
-
-            or_err = _openrouter_any_error(data)
-            if or_err:
-                code = _normalize_error_code(or_err.get("code"), 500)
-                err_msg = str(or_err.get("message") or "")
-                ra = _retry_after_seconds(resp)
-
-                logger.warning(
-                    "[openrouter] embedded error detected where=%s code=%s msg=%s meta=%s",
-                    or_err.get("where"),
-                    code,
-                    _truncate(err_msg, 300),
-                    _truncate(str(or_err.get("metadata")), 500),
-                )
-
-                if code == 429:
-                    wait_s = ra if ra > 0 else _backoff_seconds(attempt, base=2.0, cap=20.0)
-                    _mark_cooldown(api_key, wait_s)
-                    if used_model:
-                        _mark_model_cooldown(used_model, max(10.0, wait_s))
-                    last_err = {
-                        "type": "429_body",
-                        "wait": wait_s,
-                        "msg": err_msg,
-                        "key": _mask_key(api_key),
-                        "where": or_err.get("where"),
-                    }
-                    await _sleep_cap(wait_s)
-                    continue
-
-                if code == 402:
-                    if used_model:
-                        _mark_model_cooldown(used_model, 60.0)
-                    _mark_cooldown(api_key, 5.0)
-                    last_err = {
-                        "type": "402_body",
-                        "msg": err_msg,
-                        "key": _mask_key(api_key),
-                        "where": or_err.get("where"),
-                        "metadata": or_err.get("metadata"),
-                    }
-                    await _sleep_cap(_backoff_seconds(attempt, base=2.0, cap=15.0))
-                    continue
-
-                if 500 <= code <= 599:
-                    if used_model:
-                        _mark_model_cooldown(used_model, 20.0)
-                    _mark_cooldown(api_key, 3.0)
-                    last_err = {
-                        "type": "5xx_body",
-                        "status": code,
-                        "msg": err_msg,
-                        "key": _mask_key(api_key),
-                        "where": or_err.get("where"),
-                        "metadata": or_err.get("metadata"),
-                    }
-                    await _sleep_cap(_backoff_seconds(attempt, base=2.0, cap=15.0))
-                    continue
-
-                if code in (400, 422):
-                    raise HTTPException(
-                        status_code=400,
-                        detail={"error": {"message": err_msg, "where": or_err.get("where"), "metadata": or_err.get("metadata")}},
-                    )
-
-                _mark_cooldown(api_key, 5.0)
-                last_err = {
-                    "type": "4xx_body",
-                    "status": code,
-                    "msg": err_msg,
-                    "key": _mask_key(api_key),
-                    "where": or_err.get("where"),
-                }
-                await _sleep_cap(_backoff_seconds(attempt, base=2.0, cap=12.0))
-                continue
-
-            # success body: parse content
-            content = extract_text_content(data)
-            if not (content or "").strip():
-                _mark_cooldown(api_key, 3.0)
-                if used_model:
-                    _mark_model_cooldown(used_model, 20.0)
-                last_err = {"type": "no_content", "attempt": attempt + 1, "used_model": data.get("model")}
-                await _sleep_cap(_backoff_seconds(attempt, base=2.0, cap=12.0))
-                continue
-
-            return data
-
-        # 6) Non-200
+    # Si OpenRouter responde con error HTTP
+    if resp.status_code != 200:
         body = safe_json(resp)
-        err_msg = str((body.get("error") or {}).get("message") or "") if isinstance(body, dict) else str(body)[:300]
+        msg = ""
+        if isinstance(body, dict):
+            msg = str((body.get("error") or {}).get("message") or "")
+        if not msg:
+            msg = str(body)[:400]
 
+        # pasa 429 tal cual para que tu front espere y siga con otro modelo si quiere
         if resp.status_code == 429:
-            ra = _retry_after_seconds(resp)
-            wait_s = ra if ra > 0 else _backoff_seconds(attempt, base=2.0, cap=20.0)
-            _mark_cooldown(api_key, wait_s)
-            if used_model:
-                _mark_model_cooldown(used_model, max(10.0, wait_s))
-            last_err = {"type": "429", "wait": wait_s, "msg": err_msg, "key": _mask_key(api_key)}
-            await _sleep_cap(wait_s)
-            continue
+            ra = resp.headers.get("retry-after")
+            headers = {"Retry-After": ra} if ra else None
+            raise HTTPException(status_code=429, detail={"error": {"message": msg}}, headers=headers)
 
-        if 500 <= resp.status_code <= 599:
-            _mark_cooldown(api_key, 3.0)
-            if used_model:
-                _mark_model_cooldown(used_model, 20.0)
-            last_err = {"type": "5xx", "status": resp.status_code, "msg": err_msg, "key": _mask_key(api_key)}
-            await _sleep_cap(_backoff_seconds(attempt, base=2.0, cap=15.0))
-            continue
+        # 4xx -> request mala (tu payload)
+        if resp.status_code in (400, 401, 403, 404, 422):
+            raise HTTPException(status_code=resp.status_code, detail={"error": {"message": msg}})
 
-        if resp.status_code in (401, 403, 402):
-            _mark_disabled(api_key, 120.0)
-            last_err = {"type": "disabled_key", "status": resp.status_code, "msg": err_msg, "key": _mask_key(api_key)}
-            await _sleep_cap(_backoff_seconds(attempt, base=2.0, cap=12.0))
-            continue
+        # 5xx -> OpenRouter/provider
+        raise HTTPException(status_code=502, detail={"error": {"message": msg}})
 
-        if resp.status_code in (400, 422):
-            raise HTTPException(
-                status_code=400,
-                detail={"error": {"message": err_msg, "payload_hint": "Invalid request to OpenRouter"}},
-            )
+    # HTTP 200: puede venir con error embebido
+    data = safe_json(resp)
 
-        _mark_cooldown(api_key, 5.0)
-        last_err = {"type": "4xx", "status": resp.status_code, "msg": err_msg, "key": _mask_key(api_key)}
-        await _sleep_cap(_backoff_seconds(attempt, base=2.0, cap=12.0))
-        continue
+    or_err = _openrouter_any_error(data)
+    if or_err:
+        code = _normalize_error_code(or_err.get("code"), 502)
+        err_msg = str(or_err.get("message") or "OpenRouter embedded error")
 
-    # exhausted
-    if isinstance(last_err, dict) and last_err.get("type") in ("429", "429_body"):
-        retry = int(last_err.get("wait", 10) or 10)
+        # si te devuelven 429 embebido, respétalo
+        if code == 429:
+            ra = resp.headers.get("retry-after")
+            headers = {"Retry-After": ra} if ra else None
+            raise HTTPException(status_code=429, detail={"error": {"message": err_msg}}, headers=headers)
+
+        # para todo lo demás: al front para que haga fallback
         raise HTTPException(
-            status_code=429,
-            detail={"error": {"message": "Rate limited by OpenRouter", "last": last_err}},
-            headers={"Retry-After": str(retry)},
+            status_code=502,
+            detail={"error": {"message": err_msg, "where": or_err.get("where"), "metadata": or_err.get("metadata")}},
         )
+    
+    return data
 
-    raise HTTPException(
-        status_code=503,
-        detail={"error": {"message": "OpenRouter unavailable", "last": last_err}},
-    )
+
 app = FastAPI()
 
 raw_patterns = [p.strip() for p in os.getenv("VARIAMOS_CORS_ALLOWED_ORIGINS_PATTERNS", "").split(",") if p.strip()]
@@ -668,7 +517,7 @@ async def iniciar_app():
 
         timeout = httpx.Timeout(connect=10.0, read=65.0, write=10.0, pool=10.0)
         limits = httpx.Limits(max_connections=50, max_keepalive_connections=20)
-        _openrouter_client = httpx.AsyncClient(timeout=timeout, limits=limits, http2=True)
+        _openrouter_client = httpx.AsyncClient(timeout=timeout, limits=limits, http2=False)
         logger.info("OpenRouter client initialized.")
     except Exception as e:
         _openrouter_client = None
@@ -1078,59 +927,25 @@ def extract_text_content(data: dict) -> str:
 
 @router.post("/chat", response_model=AIChatResult)
 async def chat(request: Request, req: AIChatRequest):
-    models = [req.primaryModelId] + [m for m in req.fallbackModelIds if m and m != req.primaryModelId]
-    models = models[:3]
-
-    logger.info(
-        "[/api/ai/chat] -> sending to OpenRouter | primary=%s fallbacks=%s user=%s",
-        models[0],
-        models[1:],
-        getattr(getattr(request.state, "user", None), "id", None),
-    )
+    model = req.primaryModelId
 
     user_obj = getattr(getattr(request, "state", None), "user", None)
     stable_user = str(user_obj.id) if user_obj and getattr(user_obj, "id", None) else None
 
     payload = {
-        "model": models[0],
+        "model": model,
         "messages": [m.model_dump() for m in req.messages],
         "stream": False,
     }
-    if len(models) > 1:
-        payload["models"] = models
-        payload["route"] = "fallback"
     if stable_user:
         payload["user"] = stable_user
 
     data = await call_openrouter_best_effort(payload, request)
-    try:
-        keys = list(data.keys()) if isinstance(data, dict) else []
-        nchoices = len(data.get("choices") or []) if isinstance(data, dict) else 0
-        logger.info("[OpenRouter] <- response keys=%s choices=%s model(top)=%s",
-                    keys, nchoices, data.get("model") if isinstance(data, dict) else None)
-    except Exception:
-        logger.exception("[OpenRouter] log summary failed")
 
     content = extract_text_content(data)
-    used_model = extract_used_model(data, fallback=(models[0] if models else "unknown"))
-
-    logger.info("[/api/ai/chat] <- returning to front | used_model=%s content_len=%d", used_model, len(content or ""))
-
-    try:
-        ch0 = (data.get("choices") or [{}])[0] if isinstance(data, dict) else {}
-        msg = ch0.get("message") if isinstance(ch0, dict) else {}
-        raw_c = msg.get("content") if isinstance(msg, dict) else None
-        logger.info("[OpenRouter] parsed | used_model=%s | content_len=%s | raw_content_type=%s | preview=%s",
-                    used_model, len(content or ""), type(raw_c).__name__, _truncate(content, 300))
-    except Exception:
-        logger.exception("[OpenRouter] log parsed failed")
+    used_model = extract_used_model(data, fallback=model)
 
     if not (content or "").strip():
-        try:
-            logger.error("[OpenRouter] EMPTY content after parsing | used_model=%s | data_preview=%s",
-                         used_model, _truncate(str(data), 800))
-        except Exception:
-            pass
         raise HTTPException(status_code=502, detail={"error": "Empty content from OpenRouter", "usedModelId": used_model})
 
     return {"content": content, "usedModelId": used_model}
