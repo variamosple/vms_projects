@@ -5,6 +5,8 @@ from fastapi import FastAPI, Depends, HTTPException, Request, APIRouter
 from sqlalchemy.orm import Session
 from uvicorn.logging import DefaultFormatter
 from starlette.requests import Request as StarletteRequest
+from email.utils import parsedate_to_datetime
+from datetime import datetime, timezone
 
 from variamos_security import (load_keys, is_authenticated, has_roles, has_permissions, SessionUser, VariamosSecurityException, variamos_security_exception_handler)
 
@@ -148,8 +150,20 @@ def _retry_after_seconds(resp: httpx.Response) -> float:
     ra = resp.headers.get("retry-after")
     if not ra:
         return 0.0
+
+    # Caso 1: segundos (string numérico)
     try:
         return max(0.0, float(ra))
+    except Exception:
+        pass
+
+    # Caso 2: HTTP-date
+    try:
+        dt = parsedate_to_datetime(ra)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        return max(0.0, (dt - now).total_seconds())
     except Exception:
         return 0.0
 
@@ -358,6 +372,9 @@ async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request)
     - Usa round-robin para elegir key disponible
     - Si la respuesta indica problema de API key (401/403/402 o mensaje tipo invalid key),
       marca esa key como disabled para que la PRÓXIMA request rote.
+    - IMPORTANTÍSIMO: 429 "upstream/provider rate limit" NO debe enfriar (cooldown) la KEY,
+      porque no es culpa de la key y te quedas sin keys disponibles.
+      En ese caso, se enfría el MODELO (model cooldown) y se devuelve 429 al front con retryAfter.
     - Log completo de: payload enviado, headers enviados (sin Authorization real),
       status/headers/body recibidos.
     """
@@ -377,14 +394,17 @@ async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request)
     }
     if isinstance(payload.get("user"), str) and payload["user"].strip():
         payload2["user"] = payload["user"].strip()
-    MAX_BODY_LOG_CHARS = 200_000  # suficientemente grande para "ver todo" sin reventar logs
 
-    def _truncate_text(s: str, limit: int) -> str:
-        if not isinstance(s, str):
-            s = str(s)
+    MAX_BODY_LOG_CHARS = 1_000_000  # si de verdad quieres "todo", sube esto (ojo tamaño logs)
+
+    def _truncate_text(s: Any, limit: int) -> str:
+        try:
+            txt = s if isinstance(s, str) else str(s)
+        except Exception:
+            txt = "<unprintable>"
         if limit <= 0:
-            return s
-        return s if len(s) <= limit else (s[:limit] + "…[truncated]")
+            return txt
+        return txt if len(txt) <= limit else (txt[:limit] + "…[truncated]")
 
     def _mask_headers_for_log(h: Dict[str, str]) -> Dict[str, str]:
         hh = dict(h or {})
@@ -392,30 +412,75 @@ async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request)
             hh["Authorization"] = "Bearer ***"
         return hh
 
-    def _is_key_error(status_code: int, body: Any) -> bool:
-        # Casos claros por HTTP status
+    def _extract_err_fields(body: Any) -> Dict[str, Any]:
+        # Intenta extraer {code,message,metadata} de body error
+        if not isinstance(body, dict):
+            return {}
+        err = body.get("error")
+        if not isinstance(err, dict):
+            return {}
+        return {
+            "code": err.get("code"),
+            "message": err.get("message"),
+            "metadata": err.get("metadata"),
+        }
+
+    def _is_key_credential_error(status_code: int, body: Any) -> bool:
+        # 401/403/402 => (opcional) marca disabled
         if status_code in (401, 403, 402):
             return True
 
-        # Casos por body
+        # Algunos 200 traen error embebido, pero aquí usamos para no-200 principalmente.
         if isinstance(body, dict):
             err = body.get("error")
             if isinstance(err, dict):
                 code = err.get("code")
                 msg = str(err.get("message") or "").lower()
-
-                # OpenRouter a veces pone code numérico en el body
                 if isinstance(code, int) and code in (401, 403, 402):
                     return True
-
-                # Heurística por mensaje
-                key_words = ("api key", "apikey", "key", "token")
-                bad_words = ("invalid", "unauthorized", "forbidden", "rejected", "missing")
-                if any(k in msg for k in key_words) and any(b in msg for b in bad_words):
+                # Heurística de "invalid key"
+                if ("key" in msg or "token" in msg or "apikey" in msg or "api key" in msg) and (
+                    "invalid" in msg or "unauthorized" in msg or "forbidden" in msg or "rejected" in msg or "missing" in msg
+                ):
                     return True
+        return False
+
+    def _is_provider_upstream_429(body: Any) -> bool:
+        """
+        Detecta el caso que te está pegando:
+          {"error":{"message":"Provider returned error","code":429,"metadata":{"raw":"...temporarily rate-limited upstream...", "provider_name":"Venice","is_byok":false}}}
+        Esto NO depende de tu key, así que NO hay que enfriar la key.
+        """
+        if not isinstance(body, dict):
+            return False
+        err = body.get("error")
+        if not isinstance(err, dict):
+            return False
+
+        code = err.get("code")
+        if code != 429:
+            return False
+
+        meta = err.get("metadata")
+        provider_name = None
+        raw = ""
+        if isinstance(meta, dict):
+            provider_name = meta.get("provider_name")
+            raw = str(meta.get("raw") or "").lower()
+
+        msg = str(err.get("message") or "").lower()
+
+        # Señales fuertes de "provider upstream throttle"
+        if provider_name:
+            return True
+        if "temporarily rate-limited upstream" in raw:
+            return True
+        if "provider returned error" in msg and ("upstream" in raw or "rate-limited" in raw):
+            return True
 
         return False
 
+    # --- pick key ---
     now_epoch = time.time()
     api_key = await _pick_key_round_robin(now_epoch)
     if not api_key:
@@ -426,6 +491,7 @@ async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request)
             headers={"Retry-After": str(int(max(1.0, wait_s)))},
         )
 
+    # throttle local para free
     if model.endswith(":free"):
         await _free_global_limiter.acquire()
         await _limiter_for_key(api_key).acquire()
@@ -453,6 +519,7 @@ async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request)
         raise HTTPException(status_code=502, detail={"error": {"message": "Network error to OpenRouter", "exception": str(e)}})
 
     elapsed = time.time() - t0
+    raw_text = ""
     try:
         raw_text = resp.text
     except Exception:
@@ -465,20 +532,37 @@ async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request)
 
     body = safe_json(resp)
 
+    # --- HTTP != 200 ---
     if resp.status_code != 200:
+        # Si es 429, distinguir provider-upstream vs key/OpenRouter
         if resp.status_code == 429:
             wait_s = _retry_after_seconds(resp) or 8.0
-            _mark_cooldown(api_key, wait_s)
-            _mark_model_cooldown(model, wait_s)
-        if _is_key_error(resp.status_code, body):
-            _mark_disabled(api_key, 200)  # 1 hora; ajusta si quieres más
+
+            if _is_provider_upstream_429(body):
+                # ✅ FIX: NO enfriar key; enfriar modelo
+                _mark_model_cooldown(model, wait_s)
+            else:
+                # 429 más "clásico" (por key / gateway): enfriar key + modelo
+                _mark_cooldown(api_key, wait_s)
+                _mark_model_cooldown(model, wait_s)
+
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "error": {"message": "Upstream OpenRouter error", "status": 429, "model": model, "retryAfter": wait_s},
+                    "upstream": body,
+                },
+                headers={"Retry-After": str(int(max(1.0, wait_s)))},
+            )
+
+        # Credenciales/credits: marcar disabled (temporal)
+        if _is_key_credential_error(resp.status_code, body):
+            # con 3 keys, mejor “sacar” la key rota por un buen rato
+            _mark_disabled(api_key, 6 * 3600)  # 6 horas (ajusta)
             logger.warning("[openrouter] key disabled for next requests: %s (status=%s)", _mask_key(api_key), resp.status_code)
 
-        # Propaga status upstream tal cual
-        headers_out = {}
-        ra = resp.headers.get("retry-after")
-        if ra:
-            headers_out["Retry-After"] = ra
+        # Otros errores: cooldown corto para evitar loops
+        _mark_cooldown(api_key, 3.0)
 
         raise HTTPException(
             status_code=resp.status_code,
@@ -486,35 +570,36 @@ async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request)
                 "error": {"message": "Upstream OpenRouter error", "status": resp.status_code, "model": model},
                 "upstream": body,
             },
-            headers=headers_out or None,
         )
+
+    # --- HTTP 200 pero con error embebido ---
     or_err = _openrouter_any_error(body) if isinstance(body, dict) else None
     if or_err:
         code = _normalize_error_code(or_err.get("code"), 502)
-        if _is_key_error(code, body):
-            _mark_disabled(api_key, 3600.0)
-            logger.warning("[openrouter] key disabled for next requests: %s (embedded_error)", _mask_key(api_key))
+        err_msg = str(or_err.get("message") or "OpenRouter embedded error")
 
         if code == 429:
             wait_s = _retry_after_seconds(resp) or 8.0
-            _mark_cooldown(api_key, wait_s)
-            _mark_model_cooldown(model, wait_s)
+            # mismo criterio: provider-upstream vs key
+            if _is_provider_upstream_429(body):
+                _mark_model_cooldown(model, wait_s)
+            else:
+                _mark_cooldown(api_key, wait_s)
+                _mark_model_cooldown(model, wait_s)
+
             raise HTTPException(
                 status_code=429,
-                detail={"error": {"message": str(or_err.get("message") or "Rate limited"), "retryAfter": wait_s}},
-                headers={"Retry-After": str(int(wait_s))},
+                detail={"error": {"message": err_msg, "retryAfter": wait_s, "model": model}, "upstream": body},
+                headers={"Retry-After": str(int(max(1.0, wait_s)))},
             )
 
+        if _is_key_credential_error(code, body):
+            _mark_disabled(api_key, 6 * 3600)
+
+        _mark_cooldown(api_key, 3.0)
         raise HTTPException(
             status_code=502,
-            detail={
-                "error": {
-                    "message": str(or_err.get("message") or "OpenRouter embedded error"),
-                    "where": or_err.get("where"),
-                    "metadata": or_err.get("metadata"),
-                },
-                "upstream": body,
-            },
+            detail={"error": {"message": err_msg, "where": or_err.get("where"), "metadata": or_err.get("metadata")}, "upstream": body},
         )
 
     return body
