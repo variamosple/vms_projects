@@ -361,7 +361,13 @@ async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request)
                 payload2.get("route"),
                 payload2.get("user"),
             )
-            logger.info("OpenRouter key used: %s", _mask_key(api_key))
+            logger.info("payload_check: model=%s n_messages=%d roles=%s first_len=%s last_len=%s",
+            payload2.get("model"),
+            len(payload2.get("messages") or []),
+            [m.get("role") for m in (payload2.get("messages") or [])[:3]],
+            len(((payload2.get("messages") or [{}])[0].get("content") or "")),
+            len(((payload2.get("messages") or [{}])[-1].get("content") or "")))
+
 
             async with _openrouter_sem:
                 resp = await _openrouter_post_with_key(payload2, request, api_key)
