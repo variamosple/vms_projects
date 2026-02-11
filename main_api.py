@@ -401,6 +401,15 @@ async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request)
         try:
             async with _openrouter_sem:
                 resp = await _openrouter_post_with_key(payload2, request, api_key)
+                body = safe_json(resp)
+                logger.info(
+                "[openrouter] status=%s model=%s key=%s retry-after=%s body=%s",
+                resp.status_code,
+                model,
+                _mask_key(api_key),
+                resp.headers.get("retry-after"),
+                _summarize_openrouter_data(body) if isinstance(body, dict) else str(body)[:300]
+                )
         except httpx.TimeoutException:
             _mark_cooldown(api_key, 3.0)
             last_exc = HTTPException(status_code=504, detail={"error": {"message": "OpenRouter timeout"}})
@@ -422,6 +431,7 @@ async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request)
             if resp.status_code == 429:
                 wait_s = _retry_after_seconds(resp) or 8.0
                 _mark_cooldown(api_key, wait_s)
+                _mark_model_cooldown(model, wait_s)
                 last_exc = HTTPException(
                     status_code=429,
                     detail={"error": {"message": msg or "Rate limited", "retryAfter": wait_s}},
