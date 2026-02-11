@@ -377,16 +377,23 @@ async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request)
     }
     if isinstance(payload.get("user"), str) and payload["user"].strip():
         payload2["user"] = payload["user"].strip()
-
-    max_key_tries = min(len(_openrouter_keys), 3) 
+    max_key_tries = min(len(_openrouter_keys), 10)
     last_exc: Optional[HTTPException] = None
 
     for _ in range(max_key_tries):
         now_epoch = time.time()
-
         api_key = await _pick_key_round_robin(now_epoch)
+
+        # Si hay keys pero todas están en cooldown/disabled, responde 429 con retryAfter
         if not api_key:
-            break
+            wait_s = _seconds_until_any_key_available(time.time()) or 1.0
+            raise HTTPException(
+                status_code=429,
+                detail={"error": {"message": "No API key available (cooldown)", "retryAfter": wait_s}},
+                headers={"Retry-After": str(int(max(1.0, wait_s)))},
+            )
+
+        # throttle local
         if model.endswith(":free"):
             await _free_global_limiter.acquire()
             await _limiter_for_key(api_key).acquire()
@@ -415,14 +422,13 @@ async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request)
             if resp.status_code == 429:
                 wait_s = _retry_after_seconds(resp) or 8.0
                 _mark_cooldown(api_key, wait_s)
-                raise HTTPException(
+                last_exc = HTTPException(
                     status_code=429,
-                    detail={"error": {"message": msg, "retryAfter": wait_s}},
-                    headers={"Retry-After": str(int(wait_s))}
+                    detail={"error": {"message": msg or "Rate limited", "retryAfter": wait_s}},
+                    headers={"Retry-After": str(int(wait_s))},
                 )
                 continue
 
-            # key mala: deshabilitar y probar otra
             if resp.status_code in (401, 403):
                 _mark_disabled(api_key, 120.0)
                 last_exc = HTTPException(status_code=502, detail={"error": {"message": msg or "OpenRouter key rejected"}})
@@ -431,11 +437,9 @@ async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request)
             if resp.status_code == 404:
                 raise HTTPException(status_code=404, detail={"error": {"message": msg or "Model not found"}})
 
-            # 400/422: payload inválido -> no reintentar con otra key
             if resp.status_code in (400, 422):
                 raise HTTPException(status_code=400, detail={"error": {"message": msg or "Invalid request"}})
 
-            # otros (5xx, etc): probar otra key
             _mark_cooldown(api_key, 5.0)
             last_exc = HTTPException(status_code=502, detail={"error": {"message": msg or "Upstream error"}})
             continue
@@ -452,23 +456,24 @@ async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request)
                 _mark_cooldown(api_key, wait_s)
                 last_exc = HTTPException(
                     status_code=429,
-                    detail={"error": {"message": err_msg}},
+                    detail={"error": {"message": err_msg, "retryAfter": wait_s}},
                     headers={"Retry-After": str(int(wait_s))},
                 )
                 continue
 
-            raise HTTPException(
+            _mark_cooldown(api_key, 3.0)
+            last_exc = HTTPException(
                 status_code=502,
                 detail={"error": {"message": err_msg, "where": or_err.get("where"), "metadata": or_err.get("metadata")}},
             )
+            continue
 
         return data
 
-    # Sin keys útiles / todo rate-limited
     if last_exc:
         raise last_exc
 
-    raise HTTPException(status_code=503, detail={"error": {"message": "No API key available"}})
+    raise HTTPException(status_code=503, detail={"error": {"message": "OpenRouter unavailable"}})
 
 
 app = FastAPI()
