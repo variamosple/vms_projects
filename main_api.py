@@ -1,13 +1,16 @@
 import os
 import re
 import logging
-from fastapi import FastAPI, Depends, HTTPException, Request, APIRouter
+from fastapi import FastAPI, Depends, HTTPException, Request, APIRouter, File, UploadFile
+from fastapi.responses import JSONResponse
+from fastapi.responses import Response
 from sqlalchemy.orm import Session
 from uvicorn.logging import DefaultFormatter
 from starlette.requests import Request as StarletteRequest
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timezone
-
+from src.utils.arbol import generate_json, parse_uvl_content
+from src.utils.sxfm_uvl import sxfm_to_uvl
 from variamos_security import (load_keys, is_authenticated, has_roles, has_permissions, SessionUser, VariamosSecurityException, variamos_security_exception_handler)
 
 import uuid
@@ -660,6 +663,34 @@ def enforce_allowed_web_origin(request: Request):
 
     if not any(p.match(candidate) for p in ALLOWED_ORIGINS_PATTERNS):
         raise HTTPException(status_code=403, detail="Forbidden origin")
+    
+def uvl_to_json(input_data):
+    elements, relationships = parse_uvl_content(input_data)
+    json_data = generate_json(elements, relationships)
+    #print(json_data)
+    return json_data
+
+
+def sxfm_uvl(sxfm_data):
+    uvl_content = sxfm_to_uvl(sxfm_data)
+    return uvl_to_json(uvl_content)
+
+
+@app.post("/process-file")
+async def process_file(file: UploadFile = File(...)):
+    content = await file.read()
+    content = content.decode('utf-8')
+    # Determina si el contenido es UVL o SXFM
+    if file.filename.endswith('.uvl'):
+        json_data = uvl_to_json(content)
+        return Response(content=json_data, media_type="application/json")
+    elif file.filename.endswith('.xml'):
+        json_data = sxfm_uvl(content)
+        return Response(content=json_data, media_type="application/json")
+    elif file.filename.endswith('.json'):
+        return Response(content=content, media_type="application/json")
+    else:
+        return {"error": "Unsupported file format"}
 
 
 @app.get("/version")
