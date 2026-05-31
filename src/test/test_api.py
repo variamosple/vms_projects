@@ -857,3 +857,30 @@ def test_apply_configuration(client, project_data, configuration):
     assert response.status_code == 200
     print(response.json())
 
+def test_create_project_history(client, token):
+    headers = {"Authorization": f"Bearer {token}"}
+    history_data = {
+        "projectId": "94268b16-be83-4380-ba36-7514fed4875c",
+        "modelId": "ce19115c-4406-4160-a017-519eb4db8d16",
+        "actionType": "ITEM_UPDATED",
+        "entityType": "ELEMENT",
+        "entityId": "1d18eeb9-c066-474e-8c7b-0b12c649d139",
+        "entityName": "Gato",
+        "oldValue": {
+            "name": "Gato"
+        },
+        "newValue": {
+            "name": "Perro"
+        },
+        "description": "Updated element \"Gato\": name"
+    }
+    response = client.post("/projectHistory", json=history_data, headers=headers)
+    print(response.json())
+    assert response.status_code == 200
+
+def test_get_project_history(client, token):
+    headers = {"Authorization": f"Bearer {token}"}
+    project_id = "94268b16-be83-4380-ba36-7514fed4875c"
+    response = client.get("/projectHistory", params={"project_id": project_id}, headers=headers)
+    print(response.json())
+    assert response.status_code == 200

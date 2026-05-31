@@ -877,6 +877,16 @@ def apply_configuration2(project_id : str, model_id : str, configuration_id: str
 def apply_configuration(project_id : str, config_input: ConfigurationInput2):
     return project_DAO.apply_configuration(project_id, config_input.id_feature_model, config_input.id)
 
+@app.post("/projectHistory", dependencies=[Depends(is_authenticated)])
+async def register_history_event(request: Request, history_data: dict, db: Session = Depends(get_db)):
+    user_id = request.state.user.id
+    project_DAO = ProjectDao(db)
+    return project_DAO.create_history(history_data, user_id)
+
+@app.get("/projectHistory", dependencies=[Depends(is_authenticated)])
+async def get_project_history(project_id: str, db: Session = Depends(get_db)):
+    project_DAO = ProjectDao(db)
+    return project_DAO.get_history(project_id)
 
 from collections import deque
 

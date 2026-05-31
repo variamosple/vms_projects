@@ -6,7 +6,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy import DateTime, select, and_, exists, cast, String
 from sqlalchemy.sql import func
 from datetime import datetime
-from .modelDB import User, Project, user_project_association
+from .modelDB import User, Project, user_project_association, ProjectHistory
 from fastapi.responses import JSONResponse
 from ..utils.configurationManager import manage_configurations
 import json
@@ -579,4 +579,26 @@ class ProjectDao:
             return {"message": "Role retrieved successfully", "data": {"role": role}}
         else:
             raise HTTPException(status_code=404, detail="Role not found")
+        
+    def create_history(self, history_data: dict, user_id: str):
+        user = self.db.query(User).filter(User.id == user_id).first()
+        if not user:
+           self.db.close()
+           raise Exception("El usuario no existe")
+        history = ProjectHistory(id=str(uuid4()), project_id=history_data.get("projectId"), model_id=history_data.get("modelId"), user_id=user.id, author=user.name, action_type=history_data.get("actionType"), entity_type=history_data.get("entityType"), entity_id=history_data.get("entityId"), entity_name=history_data.get("entityName"), old_value=history_data.get("oldValue"), new_value=history_data.get("newValue"), 
+                                 description=history_data.get("description"), created_at=datetime.now())
+        self.db.add(history)
+        self.db.commit()
+        content = {"transactionId": "1", "message": "History event registered successfully", "data": {"id": str(history.id), "author": history.author, "createdAt": history.created_at.isoformat() if history.created_at else None}}
+        self.db.close()
+        return JSONResponse(content=content, status_code=200)
+    
+    def get_history(self, project_id: str):
+        records = (self.db.query(ProjectHistory).filter(ProjectHistory.project_id == project_id).order_by(ProjectHistory.created_at.desc()).all())
+        records_list = []
+        for history in records:
+            records_list.append({"id": str(history.id), "projectId": history.project_id, "modelId": history.model_id, "userId": history.user_id, "author": history.author, "actionType": history.action_type, "entityType": history.entity_type, "entityId": history.entity_id, "entityName": history.entity_name, "oldValue": history.old_value, "newValue": history.new_value, "description": history.description, "createdAt": history.created_at.isoformat() if history.created_at else None})
+        content = {"transactionId": "1", "message": "History retrieved successfully", "data": records_list}
+        self.db.close()
+        return JSONResponse(content=content, status_code=200)
 
