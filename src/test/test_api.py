@@ -884,3 +884,144 @@ def test_get_project_history(client, token):
     response = client.get("/projectHistory", params={"project_id": project_id}, headers=headers)
     print(response.json())
     assert response.status_code == 200
+
+def test_create_project_annotation(client, token):
+    headers = {"Authorization": f"Bearer {token}"}
+    annotation_data = {
+        "projectId": "f285351c-9e94-467a-9a23-a4ec895d4e4c",
+        "modelId": "61f40651-f3f1-40d5-a3c5-904bcd46810f",
+        "annotation": {
+            "comment": {
+                "text": "Comentario de prueba",
+                "userId": "1621858f-2dd9-4c83-b25a-ef4944144220",
+                "userName": "Usuario Test",
+                "createdAt": "2026-06-04T01:44:52.492Z"
+            },
+            "replies": [],
+            "position": {
+                "x": 472,
+                "y": 240
+            }
+        }
+    }
+    response = client.post("/projectAnnotation", json=annotation_data, headers=headers)
+    print(response.json())
+    assert response.status_code == 200
+    assert response.json()["data"]["id"] is not None
+
+
+def test_get_project_annotations(client, token):
+    headers = {"Authorization": f"Bearer {token}"}
+    model_id = "61f40651-f3f1-40d5-a3c5-904bcd46810f"
+    response = client.get("/projectAnnotation", params={"model_id": model_id}, headers=headers)
+    print(response.json())
+    assert response.status_code == 200
+    assert "data" in response.json()
+
+
+def test_update_project_annotation(client, token):
+    headers = {"Authorization": f"Bearer {token}"}
+    create_data = {
+        "projectId": "f285351c-9e94-467a-9a23-a4ec895d4e4c",
+        "modelId": "61f40651-f3f1-40d5-a3c5-904bcd46810f",
+        "annotation": {
+            "comment": {
+                "text": "Comentario antes de editar",
+                "userId": "1621858f-2dd9-4c83-b25a-ef4944144220",
+                "userName": "Usuario Test",
+                "createdAt": "2026-06-04T01:44:52.492Z"
+            },
+            "replies": [],
+            "position": {
+                "x": 100,
+                "y": 200
+            }
+        }
+    }
+    create_response = client.post("/projectAnnotation", json=create_data, headers=headers)
+    assert create_response.status_code == 200
+    annotation_id = create_response.json()["data"]["id"]
+    update_data = {
+        "annotation": {
+            "comment": {
+                "text": "Comentario editado",
+                "userId": "1621858f-2dd9-4c83-b25a-ef4944144220",
+                "userName": "Usuario Test",
+                "createdAt": "2026-06-04T01:44:52.492Z",
+                "editedAt": "2026-06-04T02:00:00.000Z"
+            },
+            "replies": [
+                {
+                    "id": "reply-test-1",
+                    "text": "Respuesta de prueba",
+                    "userId": "1621858f-2dd9-4c83-b25a-ef4944144220",
+                    "userName": "Usuario Test",
+                    "createdAt": "2026-06-04T02:01:00.000Z"
+                }
+            ],
+            "position": {
+                "x": 300,
+                "y": 400
+            }
+        }
+    }
+    response = client.put("/projectAnnotation", params={"annotation_id": annotation_id}, json=update_data, headers=headers)
+    print(response.json())
+    assert response.status_code == 200
+    assert response.json()["data"]["annotation"]["position"]["x"] == 300
+    assert len(response.json()["data"]["annotation"]["replies"]) == 1
+
+
+def test_resolve_project_annotation(client, token):
+    headers = {"Authorization": f"Bearer {token}"}
+    create_data = {
+        "projectId": "f285351c-9e94-467a-9a23-a4ec895d4e4c",
+        "modelId": "61f40651-f3f1-40d5-a3c5-904bcd46810f",
+        "annotation": {
+            "comment": {
+                "text": "Comentario para resolver",
+                "userId": "1621858f-2dd9-4c83-b25a-ef4944144220",
+                "userName": "Usuario Test",
+                "createdAt": "2026-06-04T01:44:52.492Z"
+            },
+            "replies": [],
+            "position": {
+                "x": 150,
+                "y": 250
+            }
+        }
+    }
+    create_response = client.post("/projectAnnotation", json=create_data, headers=headers)
+    assert create_response.status_code == 200
+    annotation_id = create_response.json()["data"]["id"]
+    response = client.put("/projectAnnotation/resolve", params={"annotation_id": annotation_id}, headers=headers)
+    print(response.json())
+    assert response.status_code == 200
+
+
+def test_delete_project_annotation(client, token):
+    headers = {"Authorization": f"Bearer {token}"}
+    create_data = {
+        "projectId": "f285351c-9e94-467a-9a23-a4ec895d4e4c",
+        "modelId": "61f40651-f3f1-40d5-a3c5-904bcd46810f",
+        "annotation": {
+            "comment": {
+                "text": "Comentario para eliminar",
+                "userId": "1621858f-2dd9-4c83-b25a-ef4944144220",
+                "userName": "Usuario Test",
+                "createdAt": "2026-06-04T01:44:52.492Z"
+            },
+            "replies": [],
+            "position": {
+                "x": 200,
+                "y": 300
+            }
+        }
+    }
+    create_response = client.post("/projectAnnotation", json=create_data, headers=headers)
+    assert create_response.status_code == 200
+    annotation_id = create_response.json()["data"]["id"]
+    response = client.delete("/projectAnnotation", params={"annotation_id": annotation_id}, headers=headers)
+    print(response.json())
+    assert response.status_code == 200
+    assert response.json()["data"]["id"] == annotation_id
