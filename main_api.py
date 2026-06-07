@@ -888,6 +888,32 @@ async def get_project_history(project_id: str, db: Session = Depends(get_db)):
     project_DAO = ProjectDao(db)
     return project_DAO.get_history(project_id)
 
+@app.post("/projectAnnotation", dependencies=[Depends(is_authenticated)])
+async def create_annotation(request: Request,annotation_data: dict,db: Session = Depends(get_db)):
+    user_id = request.state.user.id
+    project_DAO = ProjectDao(db)
+    return project_DAO.create_annotation(annotation_data, user_id)
+
+@app.get("/projectAnnotation", dependencies=[Depends(is_authenticated)])
+async def get_annotations(model_id: str, db: Session = Depends(get_db)):
+    project_DAO = ProjectDao(db)
+    return project_DAO.get_annotations(model_id)
+
+@app.delete("/projectAnnotation", dependencies=[Depends(is_authenticated)])
+async def delete_annotation(annotation_id: str, db: Session = Depends(get_db)):
+    project_DAO = ProjectDao(db)
+    return project_DAO.delete_annotation(annotation_id)
+
+@app.put("/projectAnnotation/resolve", dependencies=[Depends(is_authenticated)])
+async def resolve_annotation(annotation_id: str, db: Session = Depends(get_db)):
+    project_DAO = ProjectDao(db)
+    return project_DAO.resolve_annotation(annotation_id)
+
+@app.put("/projectAnnotation", dependencies=[Depends(is_authenticated)])
+async def update_annotation(annotation_id: str, annotation_data: dict, db: Session = Depends(get_db)):
+    project_DAO = ProjectDao(db)
+    return project_DAO.update_annotation(annotation_id, annotation_data)
+    
 from collections import deque
 
 OPENROUTER_MAX_CONCURRENCY = 3   

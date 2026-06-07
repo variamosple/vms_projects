@@ -6,7 +6,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy import DateTime, select, and_, exists, cast, String
 from sqlalchemy.sql import func
 from datetime import datetime
-from .modelDB import User, Project, user_project_association, ProjectHistory
+from .modelDB import User, Project, user_project_association, ProjectHistory, ProjectAnnotation
 from fastapi.responses import JSONResponse
 from ..utils.configurationManager import manage_configurations
 import json
@@ -599,6 +599,64 @@ class ProjectDao:
         for history in records:
             records_list.append({"id": str(history.id), "projectId": history.project_id, "modelId": history.model_id, "userId": history.user_id, "author": history.author, "actionType": history.action_type, "entityType": history.entity_type, "entityId": history.entity_id, "entityName": history.entity_name, "oldValue": history.old_value, "newValue": history.new_value, "description": history.description, "createdAt": history.created_at.isoformat() if history.created_at else None})
         content = {"transactionId": "1", "message": "History retrieved successfully", "data": records_list}
+        self.db.close()
+        return JSONResponse(content=content, status_code=200)
+    
+    def create_annotation(self, annotation_data: dict, user_id: str):
+        user = self.db.query(User).filter(User.id == user_id).first()
+        if not user:  
+            self.db.close()
+            raise Exception("El usuario no existe")
+        annotation = ProjectAnnotation(id=str(uuid4()), project_id=annotation_data.get("projectId"), model_id=annotation_data.get("modelId"), user_id=user.id, 
+                                       annotation=annotation_data.get("annotation"), is_resolved=False, created_at=datetime.now(), updated_at=datetime.now())
+        self.db.add(annotation)
+        self.db.commit()
+        content = { "transactionId": "1", "message": "Annotation created successfully", "data": {"id": annotation.id, "userName": user.name, "userId": annotation.user_id, "createdAt": annotation.created_at.isoformat()}}
+        self.db.close()
+        return JSONResponse(content=content, status_code=200)
+    
+    def get_annotations(self, model_id: str):
+        records = (self.db.query(ProjectAnnotation).filter(ProjectAnnotation.model_id == model_id).order_by(ProjectAnnotation.created_at.desc()).all())
+        annotations = []
+        for annotation in records:   
+            annotations.append({"id": annotation.id, "projectId": annotation.project_id, "modelId": annotation.model_id, "userId": annotation.user_id, "userName": annotation.user_ref.name if annotation.user_ref else None, "isResolved": annotation.is_resolved, "createdAt": annotation.created_at.isoformat() if annotation.created_at else None, "updatedAt": annotation.updated_at.isoformat() if annotation.updated_at else None})
+        content = {"transactionId": "1", "message": "Annotations retrieved successfully", "data": annotations}
+        self.db.close()
+        return JSONResponse(content=content, status_code=200)
+    
+    def delete_annotation(self, annotation_id: str):
+        annotation = (self.db.query(ProjectAnnotation).filter(ProjectAnnotation.id == annotation_id).first())
+        if not annotation:
+            self.db.close()
+            raise HTTPException(status_code=404, detail="Annotation not found")
+        self.db.delete(annotation)
+        self.db.commit()
+        content = {"transactionId": "1", "message": "Annotation deleted successfully", "data": {"id": annotation_id}}
+        self.db.close()
+        return JSONResponse(content=content, status_code=200)
+    
+    def resolve_annotation(self, annotation_id: str):
+        annotation = (self.db.query(ProjectAnnotation).filter(ProjectAnnotation.id == annotation_id).first())
+        if not annotation:
+            self.db.close()
+            raise HTTPException(status_code=404, detail="Annotation not found")
+        annotation.is_resolved = True
+        annotation.updated_at = datetime.now()
+        self.db.commit()
+        content = {"transactionId": "1","message": "Annotation resolved successfully"}
+        self.db.close()
+        return JSONResponse(content=content, status_code=200)
+    
+    def update_annotation(self, annotation_id: str, annotation_data: dict):
+        annotation_record = (self.db.query(ProjectAnnotation).filter(ProjectAnnotation.id == annotation_id).first())
+        if not annotation_record:
+            self.db.close()
+            raise HTTPException(status_code=404, detail="Annotation not found")
+        annotation_record.annotation = annotation_data.get("annotation")
+        annotation_record.updated_at = datetime.now()
+        flag_modified(annotation_record, "annotation")
+        self.db.commit()
+        content = {"transactionId": "1", "message": "Annotation updated successfully", "data": {"id": annotation_record.id, "annotation": annotation_record.annotation, "updatedAt": annotation_record.updated_at.isoformat() if annotation_record.updated_at else None}}
         self.db.close()
         return JSONResponse(content=content, status_code=200)
 
