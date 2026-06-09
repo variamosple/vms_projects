@@ -85,18 +85,17 @@ class ProjectHistory(Base):
     __table_args__ = {"schema": "variamos"}
 
     id = Column(String, primary_key=True, default=str(uuid4()))
-    project_id = Column(String, ForeignKey("variamos.project.id"), nullable=True)
+    project_id = Column(String, ForeignKey("variamos.project.id"), nullable=False)
     model_id = Column(String, nullable=True)
     user_id = Column(String, ForeignKey("variamos.user.id"), nullable=True)
-    author = Column(String, nullable=True)
-    action_type = Column(String, nullable=True)
-    entity_type = Column(String, nullable=True)
+    action_type = Column(String, nullable=False)
+    entity_type = Column(String, nullable=False)
     entity_id = Column(String, nullable=True)
     entity_name = Column(String, nullable=True)
     old_value = Column(JSON, nullable=True)
     new_value = Column(JSON, nullable=True)
     description = Column( String, nullable=True)
-    created_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, nullable=False)
     
     project_ref = relationship(
        "Project",

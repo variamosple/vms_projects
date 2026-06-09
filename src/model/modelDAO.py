@@ -585,11 +585,11 @@ class ProjectDao:
         if not user:
            self.db.close()
            raise Exception("El usuario no existe")
-        history = ProjectHistory(id=str(uuid4()), project_id=history_data.get("projectId"), model_id=history_data.get("modelId"), user_id=user.id, author=user.name, action_type=history_data.get("actionType"), entity_type=history_data.get("entityType"), entity_id=history_data.get("entityId"), entity_name=history_data.get("entityName"), old_value=history_data.get("oldValue"), new_value=history_data.get("newValue"), 
+        history = ProjectHistory(id=str(uuid4()), project_id=history_data.get("projectId"), model_id=history_data.get("modelId"), user_id=user.id, action_type=history_data.get("actionType"), entity_type=history_data.get("entityType"), entity_id=history_data.get("entityId"), entity_name=history_data.get("entityName"), old_value=history_data.get("oldValue"), new_value=history_data.get("newValue"), 
                                  description=history_data.get("description"), created_at=datetime.now())
         self.db.add(history)
         self.db.commit()
-        content = {"transactionId": "1", "message": "History event registered successfully", "data": {"id": str(history.id), "author": history.author, "createdAt": history.created_at.isoformat() if history.created_at else None}}
+        content = {"transactionId": "1", "message": "History event registered successfully", "data": {"id": str(history.id), "userName": user.name, "createdAt": history.created_at.isoformat() if history.created_at else None}}
         self.db.close()
         return JSONResponse(content=content, status_code=200)
     
@@ -597,7 +597,7 @@ class ProjectDao:
         records = (self.db.query(ProjectHistory).filter(ProjectHistory.project_id == project_id).order_by(ProjectHistory.created_at.desc()).all())
         records_list = []
         for history in records:
-            records_list.append({"id": str(history.id), "projectId": history.project_id, "modelId": history.model_id, "userId": history.user_id, "author": history.author, "actionType": history.action_type, "entityType": history.entity_type, "entityId": history.entity_id, "entityName": history.entity_name, "oldValue": history.old_value, "newValue": history.new_value, "description": history.description, "createdAt": history.created_at.isoformat() if history.created_at else None})
+            records_list.append({"id": str(history.id), "projectId": history.project_id, "modelId": history.model_id, "userId": history.user_id, "userName": history.user_ref.name if history.user_ref else None, "actionType": history.action_type, "entityType": history.entity_type, "entityId": history.entity_id, "entityName": history.entity_name, "oldValue": history.old_value, "newValue": history.new_value, "description": history.description, "createdAt": history.created_at.isoformat() if history.created_at else None})
         content = {"transactionId": "1", "message": "History retrieved successfully", "data": records_list}
         self.db.close()
         return JSONResponse(content=content, status_code=200)
@@ -644,6 +644,18 @@ class ProjectDao:
         annotation.updated_at = datetime.now()
         self.db.commit()
         content = {"transactionId": "1","message": "Annotation resolved successfully"}
+        self.db.close()
+        return JSONResponse(content=content, status_code=200)
+    
+    def unresolve_annotation(self, annotation_id: str):
+        annotation = (self.db.query(ProjectAnnotation).filter(ProjectAnnotation.id == annotation_id).first())
+        if not annotation:
+            self.db.close()
+            raise HTTPException(status_code=404, detail="Annotation not found")
+        annotation.is_resolved = False
+        annotation.updated_at = datetime.now()
+        self.db.commit()
+        content = {"transactionId": "1", "message": "Annotation marked as active successfully", "data": { "id": annotation.id, "isResolved": annotation.is_resolved, "updatedAt": annotation.updated_at.isoformat()}}
         self.db.close()
         return JSONResponse(content=content, status_code=200)
     

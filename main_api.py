@@ -909,6 +909,11 @@ async def resolve_annotation(annotation_id: str, db: Session = Depends(get_db)):
     project_DAO = ProjectDao(db)
     return project_DAO.resolve_annotation(annotation_id)
 
+@app.put("/projectAnnotation/unresolve", dependencies=[Depends(is_authenticated)])
+async def unresolve_annotation(annotation_id: str, db: Session = Depends(get_db)):
+    project_DAO = ProjectDao(db)
+    return project_DAO.unresolve_annotation(annotation_id)
+
 @app.put("/projectAnnotation", dependencies=[Depends(is_authenticated)])
 async def update_annotation(annotation_id: str, annotation_data: dict, db: Session = Depends(get_db)):
     project_DAO = ProjectDao(db)
