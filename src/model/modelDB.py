@@ -40,6 +40,16 @@ class Project(Base):
         "User",
         secondary= user_project_association,
         back_populates="projects"
+    )    
+    history_records = relationship(
+        "ProjectHistory",
+        back_populates="project_ref",
+        cascade="all, delete-orphan"
+    )
+    annotations = relationship(
+        "ProjectAnnotation",
+        back_populates="project_ref",
+        cascade="all, delete-orphan"
     )
 
 
@@ -60,4 +70,61 @@ class User(Base):
         "Project",
         secondary=user_project_association,
         back_populates="users"
+    )    
+    history_records = relationship(
+        "ProjectHistory",
+        back_populates="user_ref"
+    )   
+    annotations = relationship(
+        "ProjectAnnotation",
+        back_populates="user_ref"
+    )
+
+class ProjectHistory(Base):
+    __tablename__ = "project_history"
+    __table_args__ = {"schema": "variamos"}
+
+    id = Column(String, primary_key=True, default=str(uuid4()))
+    project_id = Column(String, ForeignKey("variamos.project.id"), nullable=False)
+    model_id = Column(String, nullable=True)
+    user_id = Column(String, ForeignKey("variamos.user.id"), nullable=True)
+    action_type = Column(String, nullable=False)
+    entity_type = Column(String, nullable=False)
+    entity_id = Column(String, nullable=True)
+    entity_name = Column(String, nullable=True)
+    old_value = Column(JSON, nullable=True)
+    new_value = Column(JSON, nullable=True)
+    description = Column( String, nullable=True)
+    created_at = Column(DateTime, nullable=False)
+    
+    project_ref = relationship(
+       "Project",
+       back_populates="history_records"
+    )    
+    user_ref = relationship(
+      "User",
+      back_populates="history_records"
+    )
+    
+class ProjectAnnotation(Base):
+    __tablename__ = "project_annotation"
+    __table_args__ = {"schema": "variamos"}
+
+    id = Column(String, primary_key=True, default=str(uuid4()))
+    project_id = Column(String, ForeignKey("variamos.project.id"), nullable=False)
+    model_id = Column(String, nullable=False)
+    user_id = Column(String, ForeignKey("variamos.user.id"), nullable=True)
+    annotation = Column(JSON, nullable=False)
+    is_resolved = Column(Boolean, default=False, nullable=False)
+    created_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, nullable=True)
+
+    project_ref = relationship(
+        "Project",
+        back_populates="annotations"
+    )
+
+    user_ref = relationship(
+        "User",
+        back_populates="annotations"
     )
