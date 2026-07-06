@@ -66,6 +66,12 @@ class Project(Base):
         cascade="all, delete-orphan"
     )
 
+    models = relationship(
+        "Model",
+        back_populates="project",
+        cascade="all, delete-orphan",
+    )
+
 class Model(Base):
     __tablename__ = "model"
     __table_args__ = {"schema": "variamos"}
@@ -99,6 +105,22 @@ class Model(Base):
         "ModelConfiguration",
         back_populates="model",
         cascade="all, delete-orphan"
+    )
+
+    project = relationship(
+        "Project",
+        back_populates="models",
+    )
+
+    history_records = relationship(
+        "ProjectHistory",
+        back_populates="model_ref",
+    )
+
+    annotations = relationship(
+        "ProjectAnnotation",
+        back_populates="model_ref",
+        cascade="all, delete-orphan",
     )
 
 class ModelConfiguration(Base):
