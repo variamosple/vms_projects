@@ -92,7 +92,7 @@ class ProjectDao:
         project = deepcopy(project_json)
 
         index = defaultdict(list)
-
+    
         for model in models:
             model_json = deepcopy(model.model)
 
@@ -111,17 +111,16 @@ class ProjectDao:
 
         for product_line in project.get("productLines", []):
             for engineering_type in (
+                "scope",
                 "domainEngineering",
                 "applicationEngineering",
-                "scope",
             ):
-                engineering = product_line.get(engineering_type)
+                engineering = product_line.setdefault(engineering_type, {})
 
-                if engineering:
-                    engineering["models"] = index.get(
-                        (product_line["id"], engineering_type),
-                        [],
-                    )
+                engineering["models"] = index.get(
+                    (product_line["id"], engineering_type),
+                    []
+                )
 
         return project
 
@@ -184,7 +183,6 @@ class ProjectDao:
             self.db.close()
             raise HTTPException(status_code=404, detail="Project not found")
 
-        # Force le chargement des relations avant qu'une autre méthode ferme la session
         models = list(project.models)
         for model in models:
             _ = list(model.configurations)
@@ -226,6 +224,7 @@ class ProjectDao:
             "role": role,
             "collaborators": collaborators,
         }
+        print("Project data retrieved:", project_data)  # Debugging line
 
         try:
             self.db.close()
