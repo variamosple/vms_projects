@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
-from sqlalchemy import flag_modified
+from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.orm import Session
 from variamos_security import has_permissions, ResponseModel
 from typing import Optional, Any
