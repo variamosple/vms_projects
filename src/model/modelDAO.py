@@ -1,7 +1,7 @@
 from uuid import uuid4
 
 from fastapi import HTTPException
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy import DateTime, select, and_, exists, cast, String
 from sqlalchemy.sql import func
@@ -9,7 +9,6 @@ from datetime import datetime
 from .modelDB import Model, User, Project, user_project_association, ProjectHistory, ProjectAnnotation, ModelConfiguration
 from fastapi.responses import JSONResponse
 from ..utils.configurationManager import manage_configurations
-import json
 from copy import deepcopy
 from collections import defaultdict
 
@@ -90,21 +89,39 @@ class ProjectDao:
     
         
     def _rebuild_project(self, project_json, models):
-
         project = deepcopy(project_json)
+
         index = defaultdict(list)
+
         for model in models:
-            index[(model.product_line_id, model.engineering_type,)].append(model.model)
+            model_json = deepcopy(model.model)
+
+            model_json["id"] = model.id
+            model_json["projectId"] = model.project_id
+            model_json["productLineId"] = model.product_line_id
+            model_json["engineeringType"] = model.engineering_type
+            model_json["name"] = model.name
+            model_json["type"] = model.type
+            model_json["description"] = model.description
+            model_json["author"] = model.author
+            model_json["source"] = model.source
+            model_json["languageId"] = model.language_id
+
+            index[(model.product_line_id, model.engineering_type)].append(model_json)
 
         for product_line in project.get("productLines", []):
-            for engineering_type in ("domainEngineering", "applicationEngineering", "scope", ):
-
+            for engineering_type in (
+                "domainEngineering",
+                "applicationEngineering",
+                "scope",
+            ):
                 engineering = product_line.get(engineering_type)
 
-                if not engineering:
-                    continue
-
-                engineering["models"] = index.get((product_line["id"], engineering_type, ), [],)
+                if engineering:
+                    engineering["models"] = index.get(
+                        (product_line["id"], engineering_type),
+                        [],
+                    )
 
         return project
 
@@ -151,11 +168,26 @@ class ProjectDao:
                 )
             )
 
+    
+
     def get_by_id(self, user_id: str, project_id: str):
-        project = self.db.query(Project).filter(Project.id == project_id).first()
+        project = (
+            self.db.query(Project)
+            .options(
+                selectinload(Project.models).selectinload(Model.configurations)
+            )
+            .filter(Project.id == project_id)
+            .first()
+        )
+
         if not project:
             self.db.close()
             raise HTTPException(status_code=404, detail="Project not found")
+
+        # Force le chargement des relations avant qu'une autre méthode ferme la session
+        models = list(project.models)
+        for model in models:
+            _ = list(model.configurations)
 
         role = None
         collaborators = []
@@ -174,6 +206,11 @@ class ProjectDao:
             except Exception:
                 collaborators = []
 
+        all_configurations = []
+
+        for model in project.models:
+            all_configurations.extend(model.configurations)
+
         project_data = {
             "id": project.id,
             "name": project.name,
@@ -184,14 +221,24 @@ class ProjectDao:
             "source": project.source,
             "author": project.author,
             "date": project.date,
-            "configuration": self._rebuild_configurations(project.models),
+            "configuration": self._rebuild_configurations(all_configurations),
             "is_collaborative": project.is_collaborative,
             "role": role,
             "collaborators": collaborators,
         }
 
-        self.db.close()
-        return {"transactionId": "1", "message": "Ok", "data": {"project": project_data}}
+        try:
+            self.db.close()
+        except Exception:
+            pass
+
+        return {
+            "transactionId": "1",
+            "message": "Ok",
+            "data": {
+                "project": project_data
+            }
+        }
 
     def apply_configuration(self, project_id: str, model_id: str, configuration_id: str):
         project = self.db.query(Project).filter(Project.id == project_id).first()
@@ -363,11 +410,22 @@ class ProjectDao:
         return JSONResponse(content=content, status_code=200)
 
     def add_configuration(self, project_id: str, project_json: dict, id_feature_model, config_name: str):
-        project = self.db.query(Project).filter(Project.id == project_id).first()
+        project = (
+            self.db.query(Project)
+            .options(
+                selectinload(Project.models).selectinload(Model.configurations)
+            )
+            .filter(Project.id == project_id)
+            .first()
+        )        
         if not project:
             self.db.close()
             raise HTTPException(status_code=404, detail="Project not found")
-        configuration_json = self._rebuild_configurations(project.models)
+        all_configurations = []
+        for model in project.models:
+            all_configurations.extend(model.configurations)
+
+        configuration_json = self._rebuild_configurations(all_configurations)
         configuration_json = manage_configurations(
             project_json,
             id_feature_model,
