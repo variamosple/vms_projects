@@ -1,5 +1,5 @@
 from uuid import uuid4
-
+from sqlalchemy import func
 from sqlalchemy import (
     Boolean,
     Table,
@@ -95,11 +95,16 @@ class Model(Base):
         nullable=False,
         index=True
     )
+
+    language = relationship(
+        "Language",
+        back_populates="models"
+    )
+    
     description = Column(String, nullable=True)
     author = Column(String, nullable=True)
     source = Column(String, nullable=True)    
     model = Column(JSON, nullable=False)
-    project = relationship("Project", back_populates="models")
 
     configurations = relationship(
         "ModelConfiguration",
@@ -269,4 +274,63 @@ class ProjectAnnotation(Base):
     user_ref = relationship(
         "User",
         back_populates="annotations",
+    )
+
+class Language(Base):
+    __tablename__ = "language"
+    __table_args__ = {"schema": "variamos"}
+
+    id = Column(
+        Integer,
+        primary_key=True,
+        autoincrement=True
+    )
+
+    name = Column(
+        String,
+        nullable=True
+    )
+
+    abstractSyntax = Column(
+        JSON,
+        nullable=True
+    )
+
+    concreteSyntax = Column(
+        JSON,
+        nullable=True
+    )
+
+    type = Column(
+        String,
+        nullable=True
+    )
+
+    stateAccept = Column(
+        String,
+        nullable=True
+    )
+
+    semantics = Column(
+        JSON,
+        nullable=True,
+        default={}
+    )
+
+    created_at = Column(
+        DateTime,
+        nullable=False,
+        server_default=func.now()
+    )
+
+    updated_at = Column(
+        DateTime,
+        nullable=True,
+        server_default=func.now(),
+        onupdate=func.now()
+    )
+
+    models = relationship(
+        "Model",
+        back_populates="language"
     )
