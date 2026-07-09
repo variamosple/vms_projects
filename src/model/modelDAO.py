@@ -646,17 +646,46 @@ class ProjectDao:
     def create_history(self, history_data: dict, user_id: str):
         user = self.db.query(User).filter(User.id == user_id).first()
         if not user:
+            self.db.close()
+            raise Exception("El usuario no existe")
+        
+        required_fields = ["projectId", "modelId", "actionType", "entityType", "entityId", "entityName"]
+        missing_fields = [f for f in required_fields if not history_data.get(f)]
+        if missing_fields:   
            self.db.close()
-           raise Exception("El usuario no existe")
-        history = ProjectHistory(id=str(uuid4()), project_id=history_data.get("projectId"), model_id=history_data.get("modelId"), user_id=user.id, action_type=history_data.get("actionType"), entity_type=history_data.get("entityType"), entity_id=history_data.get("entityId"), entity_name=history_data.get("entityName"), old_value=history_data.get("oldValue"), new_value=history_data.get("newValue"), 
-                                 description=history_data.get("description"), created_at=datetime.now())
+           raise HTTPException(status_code=400, detail=f"Missing required fields: {', '.join(missing_fields)}")
+
+        project_id = history_data.get("projectId")
+
+        project_exists = self.db.query(exists().where(Project.id == project_id)).scalar()
+        if not project_exists:
+             self.db.close()
+             raise HTTPException(status_code=404, detail="Project not found")
+
+        is_member = self.db.query(user_project_association).filter(and_(user_project_association.c.project_id == project_id, user_project_association.c.user_id == user_id)).first()
+        if not is_member:
+            self.db.close()
+            raise HTTPException(status_code=403, detail="User does not have access to this project")
+
+        history = ProjectHistory(id=str(uuid4()), project_id=project_id, model_id=history_data.get("modelId"), user_id=user.id, action_type=history_data.get("actionType"), 
+                                 entity_type=history_data.get("entityType"), entity_id=history_data.get("entityId"), entity_name=history_data.get("entityName"), old_value=history_data.get("oldValue"), new_value=history_data.get("newValue"), description=history_data.get("description"), created_at=datetime.now())
         self.db.add(history)
         self.db.commit()
         content = {"transactionId": "1", "message": "History event registered successfully", "data": {"id": str(history.id), "userName": user.name, "createdAt": history.created_at.isoformat() if history.created_at else None}}
         self.db.close()
         return JSONResponse(content=content, status_code=200)
     
-    def get_history(self, project_id: str):
+    def get_history(self, project_id: str, user_id: str):
+        project_exists = self.db.query(exists().where(Project.id == project_id)).scalar()
+        if not project_exists:
+            self.db.close()
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        is_member = self.db.query(user_project_association).filter(and_(user_project_association.c.project_id == project_id, user_project_association.c.user_id == user_id)).first()
+        if not is_member:
+            self.db.close()
+            raise HTTPException(status_code=403, detail="User does not have access to this project")
+
         records = (self.db.query(ProjectHistory).filter(ProjectHistory.project_id == project_id).order_by(ProjectHistory.created_at.desc()).all())
         records_list = []
         for history in records:
