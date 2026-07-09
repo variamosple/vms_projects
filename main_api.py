@@ -884,9 +884,10 @@ async def register_history_event(request: Request, history_data: dict, db: Sessi
     return project_DAO.create_history(history_data, user_id)
 
 @app.get("/projectHistory", dependencies=[Depends(is_authenticated)])
-async def get_project_history(project_id: str, db: Session = Depends(get_db)):
+async def get_project_history(project_id: str, request: Request, db: Session = Depends(get_db)):
+    user_id = request.state.user.id
     project_DAO = ProjectDao(db)
-    return project_DAO.get_history(project_id)
+    return project_DAO.get_history(project_id, user_id)
 
 @app.post("/projectAnnotation", dependencies=[Depends(is_authenticated)])
 async def create_annotation(request: Request,annotation_data: dict,db: Session = Depends(get_db)):

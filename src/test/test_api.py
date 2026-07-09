@@ -860,11 +860,11 @@ def test_apply_configuration(client, project_data, configuration):
 def test_create_project_history(client, token):
     headers = {"Authorization": f"Bearer {token}"}
     history_data = {
-        "projectId": "94268b16-be83-4380-ba36-7514fed4875c",
-        "modelId": "ce19115c-4406-4160-a017-519eb4db8d16",
+        "projectId": "11b40dc9-d41b-4ead-924f-8a51f15dff1a",
+        "modelId": "7fbd7609-87b1-4139-86e5-28aff9f32b68",
         "actionType": "ITEM_UPDATED",
         "entityType": "ELEMENT",
-        "entityId": "1d18eeb9-c066-474e-8c7b-0b12c649d139",
+        "entityId": "5f1183a3-b19a-41e7-a45b-b42bb32a601c",
         "entityName": "Gato",
         "oldValue": {
             "name": "Gato"
@@ -880,10 +880,94 @@ def test_create_project_history(client, token):
 
 def test_get_project_history(client, token):
     headers = {"Authorization": f"Bearer {token}"}
-    project_id = "94268b16-be83-4380-ba36-7514fed4875c"
+    project_id = "11b40dc9-d41b-4ead-924f-8a51f15dff1a"
     response = client.get("/projectHistory", params={"project_id": project_id}, headers=headers)
     print(response.json())
     assert response.status_code == 200
+
+def test_create_project_history_missing_fields(client, token):
+    headers = {"Authorization": f"Bearer {token}"}
+    incomplete_data = {
+        "projectId": "11b40dc9-d41b-4ead-924f-8a51f15dff1a",
+        "modelId": "7fbd7609-87b1-4139-86e5-28aff9f32b68",
+        "entityType": "ELEMENT",
+        "entityName": "Gato",
+    }
+    response = client.post("/projectHistory", json=incomplete_data, headers=headers)
+    logger.info("status incomplete history: %s / %s", response.status_code, response.text)
+    assert response.status_code in (400, 422)
+ 
+ 
+def test_create_project_history_nonexistent_project(client, token):
+    headers = {"Authorization": f"Bearer {token}"}
+    history_data = {
+        "projectId": "00000000-0000-0000-0000-000000000000",
+        "modelId": "7fbd7609-87b1-4139-86e5-28aff9f32b68",
+        "actionType": "ITEM_UPDATED",
+        "entityType": "ELEMENT",
+        "entityId": "5f1183a3-b19a-41e7-a45b-b42bb32a601c",
+        "entityName": "Gato",
+        "oldValue": {"name": "Gato"},
+        "newValue": {"name": "Perro"},
+        "description": "Updated element \"Gato\": name",
+    }
+    response = client.post("/projectHistory", json=history_data, headers=headers)
+    logger.info("status nonexistent project history: %s / %s", response.status_code, response.text)
+    assert response.status_code == 404
+ 
+ 
+def test_get_project_history_empty(client, token):
+    headers = {"Authorization": f"Bearer {token}"}
+    project_id = "ebd62ed7-f1f2-4c9e-bfe6-500da7035405"
+    response = client.get("/projectHistory", params={"project_id": project_id}, headers=headers)
+    body = response.json()
+    logger.info("empty history response: %s", body)
+    assert response.status_code == 200
+    assert body["data"] == []
+ 
+ 
+def test_get_project_history_chronological_order(client, token):
+    headers = {"Authorization": f"Bearer {token}"}
+    project_id = "11b40dc9-d41b-4ead-924f-8a51f15dff1a"
+    model_id = "7fbd7609-87b1-4139-86e5-28aff9f32b68"
+ 
+    entity_names = ["Primero", "Segundo", "Tercero"]
+    created_ids = []
+    for name in entity_names:
+        history_data = {
+            "projectId": project_id,
+            "modelId": model_id,
+            "actionType": "ITEM_UPDATED",
+            "entityType": "ELEMENT",
+            "entityId": "1d18eeb9-c066-474e-8c7b-0b12c649d139",
+            "entityName": name,
+            "oldValue": {"name": "x"},
+            "newValue": {"name": name},
+            "description": f"Updated element to {name}",
+        }
+        create_response = client.post("/projectHistory", json=history_data, headers=headers)
+        assert create_response.status_code == 200
+        created_ids.append(create_response.json()["data"]["id"])
+ 
+    response = client.get("/projectHistory", params={"project_id": project_id}, headers=headers)
+    body = response.json()
+    logger.info("chronological history response: %s", body)
+    assert response.status_code == 200
+    returned_ids_in_order = [
+        record["id"] for record in body["data"] if record["id"] in created_ids
+    ]
+    assert returned_ids_in_order == list(reversed(created_ids))
+
+ 
+ 
+def test_get_project_history_unauthorized_user(client, token):
+    headers = {"Authorization": f"Bearer {token}"}
+ 
+    project_id = "cd5ec8e6-3f7c-49b2-aba0-6221c428414e"
+    response = client.get("/projectHistory", params={"project_id": project_id}, headers=headers)
+    logger.info("unauthorized history response: %s / %s", response.status_code, response.text)
+    assert response.status_code == 403
+
 
 def test_create_project_annotation(client, token):
     headers = {"Authorization": f"Bearer {token}"}
@@ -997,6 +1081,34 @@ def test_resolve_project_annotation(client, token):
     response = client.put("/projectAnnotation/resolve", params={"annotation_id": annotation_id}, headers=headers)
     print(response.json())
     assert response.status_code == 200
+
+def test_unresolve_project_annotation(client, token):
+    headers = {"Authorization": f"Bearer {token}"}
+    create_data = {
+        "projectId": "f285351c-9e94-467a-9a23-a4ec895d4e4c",
+        "modelId": "61f40651-f3f1-40d5-a3c5-904bcd46810f",
+        "annotation": {
+            "comment": {
+                "text": "Comentario para reactivar",
+                "userId": "1621858f-2dd9-4c83-b25a-ef4944144220",
+                "userName": "Usuario Test",
+                "createdAt": "2026-06-04T01:44:52.492Z"
+            },
+            "replies": [],
+            "position": {
+                "x": 150,
+                "y": 250
+            }
+        }
+    }
+    create_response = client.post("/projectAnnotation", json=create_data, headers=headers)
+    assert create_response.status_code == 200
+    annotation_id = create_response.json()["data"]["id"]
+    resolve_response = client.put("/projectAnnotation/resolve", params={"annotation_id": annotation_id}, headers=headers)
+    assert resolve_response.status_code == 200
+    unresolve_response = client.put("/projectAnnotation/unresolve", params={"annotation_id": annotation_id}, headers=headers)
+    print(unresolve_response.json())
+    assert unresolve_response.status_code == 200
 
 
 def test_delete_project_annotation(client, token):
