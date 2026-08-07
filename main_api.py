@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from src.utils.arbol import generate_json, parse_uvl_content
 from src.utils.sxfm_uvl import sxfm_to_uvl
 from variamos_security import (load_keys, is_authenticated, has_roles, has_permissions, SessionUser, VariamosSecurityException, variamos_security_exception_handler)
+from src.utils.conflictJob import run_conflict_auto_resolve_loop
 
 import uuid
 import time
@@ -79,6 +80,7 @@ _openrouter_keys: List[str] = []
 _openrouter_key_state: Dict[str, Dict[str, Any]] = {}  # {key: {"cooldown_until": float, "disabled_until": float}}
 _openrouter_last_idx: int = 0
 _openrouter_client: Optional[httpx.AsyncClient] = None
+_conflict_auto_resolve_task: Optional[asyncio.Task] = None
 _openrouter_model_state: Dict[str, float] = {} 
 _model_lock = asyncio.Lock()
 
@@ -725,15 +727,21 @@ async def iniciar_app():
         _openrouter_keys = []
         logger.exception(f"OpenRouter init failed (service will still run): {e}")
     await _ensure_openrouter_initialized()
+    
+    global _conflict_auto_resolve_task
+    _conflict_auto_resolve_task = asyncio.create_task(run_conflict_auto_resolve_loop())
+    logger.info("Conflict auto-resolve background task started.")
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    global _openrouter_client
+    global _openrouter_client, _conflict_auto_resolve_task
     try:
         if _openrouter_client is not None:
             await _openrouter_client.aclose()
     finally:
+        if _conflict_auto_resolve_task is not None:
+            _conflict_auto_resolve_task.cancel()
         close_db()
 
 
@@ -919,6 +927,36 @@ async def unresolve_annotation(annotation_id: str, db: Session = Depends(get_db)
 async def update_annotation(annotation_id: str, annotation_data: dict, db: Session = Depends(get_db)):
     project_DAO = ProjectDao(db)
     return project_DAO.update_annotation(annotation_id, annotation_data)
+
+@app.post("/projectConflict", dependencies=[Depends(is_authenticated)])
+async def create_conflict(request: Request, conflict_data: dict, db: Session = Depends(get_db)):
+    user_id = request.state.user.id
+    project_DAO = ProjectDao(db)
+    return project_DAO.create_conflict(conflict_data, user_id)
+
+@app.get("/projectConflict", dependencies=[Depends(is_authenticated)])
+async def get_conflicts(request: Request, project_id: str, model_id: str = None, db: Session = Depends(get_db)):
+    user_id = request.state.user.id
+    project_DAO = ProjectDao(db)
+    return project_DAO.get_conflicts(project_id, user_id, model_id)
+
+@app.post("/projectConflict/change", dependencies=[Depends(is_authenticated)])
+async def add_conflict_change(request: Request, conflict_id: str, change_data: dict, db: Session = Depends(get_db)):
+    user_id = request.state.user.id
+    project_DAO = ProjectDao(db)
+    return project_DAO.add_conflict_change(conflict_id, user_id, change_data.get("proposedValue"), change_data.get("operation"))
+
+@app.post("/projectConflict/vote", dependencies=[Depends(is_authenticated)])
+async def vote_conflict(request: Request, conflict_id: str, field_name: str, change_id: str, db: Session = Depends(get_db)):
+    user_id = request.state.user.id
+    project_DAO = ProjectDao(db)
+    return project_DAO.vote_conflict(conflict_id, user_id, field_name, change_id)
+
+@app.put("/projectConflict/resolve", dependencies=[Depends(is_authenticated)])
+async def resolve_conflict(request: Request, conflict_id: str, db: Session = Depends(get_db)):
+    user_id = request.state.user.id
+    project_DAO = ProjectDao(db)
+    return project_DAO.resolve_conflict(conflict_id, user_id)
     
 from collections import deque
 
