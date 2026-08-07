@@ -5,12 +5,13 @@ from sqlalchemy.orm import Session, selectinload
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy import DateTime, select, and_, exists, cast, String
 from sqlalchemy.sql import func
-from datetime import datetime
-from .modelDB import Model, User, Project, user_project_association, ProjectHistory, ProjectAnnotation, ModelConfiguration
+from datetime import datetime, timedelta
+from .modelDB import Model, User, Project, user_project_association, ProjectHistory, ProjectAnnotation, ProjectConflict, ProjectConflictChange, ProjectConflictVote, ModelConfiguration
 from fastapi.responses import JSONResponse
 from ..utils.configurationManager import manage_configurations
 from copy import deepcopy
 from collections import defaultdict
+from collections import Counter
 
 class UserDao:
     def __init__(self, db: Session):
@@ -763,4 +764,268 @@ class ProjectDao:
         content = {"transactionId": "1", "message": "Annotation updated successfully", "data": {"id": annotation_record.id, "annotation": annotation_record.annotation, "updatedAt": annotation_record.updated_at.isoformat() if annotation_record.updated_at else None}}
         self.db.close()
         return JSONResponse(content=content, status_code=200)
+    
+    def create_conflict(self, conflict_data: dict, user_id: str):
+        required_fields = ["projectId", "modelId", "entityType", "entityId", "conflictType", "conflictingFields"]
+        missing_fields = [f for f in required_fields if not conflict_data.get(f)]
+        if missing_fields:
+            self.db.close()
+            raise HTTPException(status_code=400, detail=f"Missing required fields: {', '.join(missing_fields)}")
+
+        project_id = conflict_data.get("projectId")
+        model_id = conflict_data.get("modelId")
+        entity_id = conflict_data.get("entityId")
+
+        project_exists = self.db.query(exists().where(Project.id == project_id)).scalar()
+        if not project_exists:
+            self.db.close()
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        is_member = self.db.query(user_project_association).filter(and_(user_project_association.c.project_id == project_id, user_project_association.c.user_id == user_id)).first()
+        if not is_member:
+            self.db.close()
+            raise HTTPException(status_code=403, detail="User does not have access to this project")
+
+        conflict = (self.db.query(ProjectConflict).filter(ProjectConflict.model_id == model_id, ProjectConflict.entity_id == entity_id, ProjectConflict.status == "pending").first())
+        CONFLICT_EXPIRATION = timedelta(days=1)
+        
+        if conflict is None:
+            now = datetime.now()
+            conflict = ProjectConflict(id=str(uuid4()), project_id=project_id, model_id=model_id, entity_type=conflict_data.get("entityType"), entity_id=entity_id, entity_name=conflict_data.get("entityName"), conflict_type=conflict_data.get("conflictType"), status="pending", base_value=conflict_data.get("baseValue"), conflicting_fields=conflict_data.get("conflictingFields", []), created_at=now , expires_at=now + CONFLICT_EXPIRATION )
+            self.db.add(conflict)
+            self.db.flush()
+        else:
+            existing_fields = set(conflict.conflicting_fields or [])
+            new_fields = set(conflict_data.get("conflictingFields") or [])
+            merged_fields = list(existing_fields | new_fields)
+            if merged_fields != (conflict.conflicting_fields or []):
+                conflict.conflicting_fields = merged_fields
+                flag_modified(conflict, "conflicting_fields")
+
+        proposed_value = conflict_data.get("proposedValue")
+        operation = conflict_data.get("operation")
+        if proposed_value is not None and operation is not None:
+            existing_change = self.db.query(ProjectConflictChange).filter(and_(ProjectConflictChange.conflict_id == conflict.id, ProjectConflictChange.user_id == user_id)).first()
+            if existing_change:
+                existing_change.proposed_value = proposed_value
+                existing_change.operation = operation
+                flag_modified(existing_change, "proposed_value")
+                flag_modified(existing_change, "operation")
+            else:
+                self.db.add(ProjectConflictChange(id=str(uuid4()), conflict_id=conflict.id, user_id=user_id, proposed_value=proposed_value, operation=operation, created_at=datetime.now()))
+                
+        remote_user_id = conflict_data.get("remoteUserId")
+        remote_value = conflict_data.get("remoteProposedValue")
+        remote_operation = conflict_data.get("remoteOperation")
+
+        if remote_user_id and remote_user_id != user_id and remote_value is not None and remote_operation is not None:
+            existing_remote_change = self.db.query(ProjectConflictChange).filter(and_(ProjectConflictChange.conflict_id == conflict.id, ProjectConflictChange.user_id == remote_user_id)).first()
+            if existing_remote_change:
+                existing_remote_change.proposed_value = remote_value
+                existing_remote_change.operation = remote_operation
+                flag_modified(existing_remote_change, "proposed_value")
+                flag_modified(existing_remote_change, "operation")
+            else:
+                self.db.add(ProjectConflictChange(id=str(uuid4()), conflict_id=conflict.id, user_id=remote_user_id, proposed_value=remote_value, operation=remote_operation, created_at=datetime.now()))
+        
+
+        self.db.commit()
+
+        content = {"transactionId": "1", "message": "Conflict registered successfully", "data": { "id": conflict.id, "projectId": conflict.project_id, "modelId": conflict.model_id, "entityType": conflict.entity_type, "entityId": conflict.entity_id, "entityName": conflict.entity_name, "conflictType": conflict.conflict_type, "status": conflict.status, "baseValue": conflict.base_value, "conflictingFields": conflict.conflicting_fields, "createdAt": conflict.created_at.isoformat() if conflict.created_at else None, "expiresAt": conflict.expires_at.isoformat() if conflict.expires_at else None}}
+        self.db.close()
+        return JSONResponse(content=content, status_code=200)
+    
+    def add_conflict_change(self, conflict_id: str, user_id: str, proposed_value: dict, operation: dict):
+        conflict = self.db.query(ProjectConflict).filter(ProjectConflict.id == conflict_id).first()
+        if not conflict:
+            self.db.close()
+            raise HTTPException(status_code=404, detail="Conflict not found")
+
+        if conflict.status == "resolved":
+            self.db.close()
+            raise HTTPException(status_code=409, detail="Conflict has already been resolved")
+
+        is_member = self.db.query(user_project_association).filter(and_(user_project_association.c.project_id == conflict.project_id, user_project_association.c.user_id == user_id)).first()
+        if not is_member:  
+            self.db.close()
+            raise HTTPException(status_code=403, detail="User does not have access to this project")
+
+        existing = self.db.query(ProjectConflictChange).filter(and_(ProjectConflictChange.conflict_id == conflict_id, ProjectConflictChange.user_id == user_id,)).first()
+        if existing:
+            existing.proposed_value = proposed_value
+            existing.operation = operation
+            flag_modified(existing, "proposed_value")
+            flag_modified(existing, "operation")
+            change = existing
+        else:
+            change = ProjectConflictChange(id=str(uuid4()), conflict_id=conflict_id, user_id=user_id, proposed_value=proposed_value, operation=operation, created_at=datetime.now())
+            self.db.add(change)
+        
+        self.db.commit()
+        user = self.db.query(User).filter(User.id == user_id).first()
+        content = {"transactionId": "1", "message": "Proposal registered successfully","data": {"id": change.id, "conflictId": change.conflict_id, "userId": change.user_id, "userName": user.name if user else None, "proposedValue": change.proposed_value, "createdAt": change.created_at.isoformat() if change.created_at else None},}
+        self.db.close()
+        return JSONResponse(content=content, status_code=200)
+    
+    def vote_conflict(self, conflict_id: str, user_id: str, field_name: str, change_id: str):
+        conflict = (self.db.query(ProjectConflict).options(selectinload(ProjectConflict.changes), selectinload(ProjectConflict.votes)).filter(ProjectConflict.id == conflict_id).first())
+        if not conflict:
+            self.db.close()
+            raise HTTPException(status_code=404, detail="Conflict not found")
+
+        if conflict.status == "resolved":
+            self.db.close()
+            raise HTTPException(status_code=409, detail="Conflict has already been resolved")
+
+        if field_name not in (conflict.conflicting_fields or []):
+            self.db.close()
+            raise HTTPException(status_code=400, detail=f"'{field_name}' is not a conflicting field for this conflict")
+
+        is_member = self.db.query(user_project_association).filter(and_(user_project_association.c.project_id == conflict.project_id, user_project_association.c.user_id == user_id)).first()
+        if not is_member:
+            self.db.close()
+            raise HTTPException(status_code=403, detail="User does not have access to this project")
+        
+        if is_member.role == "viewer":  
+            self.db.close()
+            raise HTTPException(status_code=403, detail="Viewers are not allowed to vote on conflicts")
+
+        change = self.db.query(ProjectConflictChange).filter(and_(ProjectConflictChange.id == change_id, ProjectConflictChange.conflict_id == conflict_id)).first()
+        if not change:
+            self.db.close()
+            raise HTTPException(status_code=404, detail="Proposal not found for this conflict")
+
+        existing_vote = self.db.query(ProjectConflictVote).filter(and_(ProjectConflictVote.conflict_id == conflict_id, ProjectConflictVote.field_name == field_name, ProjectConflictVote.voter_user_id == user_id)).first()
+        if existing_vote:
+            existing_vote.change_id = change_id
+            existing_vote.updated_at = datetime.now()
+            vote = existing_vote
+        else:
+            vote = ProjectConflictVote(id=str(uuid4()), conflict_id=conflict_id, field_name=field_name, voter_user_id=user_id, change_id=change_id, created_at=datetime.now())
+            self.db.add(vote)
+
+        self.db.commit()
+
+        self.db.refresh(conflict)
+        fields = conflict.conflicting_fields or []
+
+        if fields:
+            member_count = (self.db.query(user_project_association).filter(user_project_association.c.project_id == conflict.project_id, user_project_association.c.role != "viewer").count())
+
+            if member_count > 0:
+                votes_by_field = defaultdict(set)
+                for v in conflict.votes:
+                    votes_by_field[v.field_name].add(v.voter_user_id)
+                all_fields_fully_voted = all(len(votes_by_field.get(f, set())) >= member_count for f in fields)
+
+                if all_fields_fully_voted:
+                    conflict.status = "resolved"
+                    conflict.resolution_type = "merge"
+                    conflict.resolved_value = self._tally_conflict_votes(conflict)
+                    conflict.resolved_at = datetime.now()
+                    self.db.commit()
+
+        content = {"transactionId": "1", "message": "Vote registered successfully", "data": {"id": vote.id, "conflictId": vote.conflict_id, "fieldName": vote.field_name, "voterUserId": vote.voter_user_id, "changeId": vote.change_id}}
+        self.db.close()
+        return JSONResponse(content=content, status_code=200)
+    
+    def get_conflicts(self, project_id: str, user_id: str, model_id: str = None):
+        project_exists = self.db.query(exists().where(Project.id == project_id)).scalar()
+        if not project_exists:
+            self.db.close()
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        is_member = self.db.query(user_project_association).filter(and_(user_project_association.c.project_id == project_id, user_project_association.c.user_id == user_id)).first()
+        if not is_member:
+            self.db.close()
+            raise HTTPException(status_code=403, detail="User does not have access to this project")
+
+        query = (self.db.query(ProjectConflict).options(selectinload(ProjectConflict.changes).selectinload(ProjectConflictChange.user_ref), selectinload(ProjectConflict.votes)).filter(ProjectConflict.project_id == project_id))
+        if model_id:  
+            query = query.filter(ProjectConflict.model_id == model_id)
+
+        records = query.order_by(ProjectConflict.created_at.desc()).all()
+
+        conflicts = []
+        for conflict in records:
+            changes = [{"id": change.id, "userId": change.user_id, "userName": change.user_ref.name if change.user_ref else None, "proposedValue": change.proposed_value, "createdAt": change.created_at.isoformat() if change.created_at else None} for change in conflict.changes]
+            votes = [{"fieldName": vote.field_name, "voterUserId": vote.voter_user_id, "changeId": vote.change_id} for vote in conflict.votes]
+            conflicts.append({"id": conflict.id, "projectId": conflict.project_id, "modelId": conflict.model_id, "entityType": conflict.entity_type, "entityId": conflict.entity_id, "entityName": conflict.entity_name, "conflictType": conflict.conflict_type, "status": conflict.status, "baseValue": conflict.base_value, "conflictingFields": conflict.conflicting_fields, "changes": changes, "votes": votes, "resolvedValue": conflict.resolved_value, "resolutionType": conflict.resolution_type, "createdAt": conflict.created_at.isoformat() if conflict.created_at else None, "expiresAt": conflict.expires_at.isoformat() if conflict.expires_at else None, "resolvedAt": conflict.resolved_at.isoformat() if conflict.resolved_at else None})
+
+        content = {"transactionId": "1", "message": "Conflicts retrieved successfully", "data": conflicts}
+        self.db.close()
+        return JSONResponse(content=content, status_code=200)
+    
+    def _tally_conflict_votes(self, conflict) -> dict:
+        changes_by_id = {c.id: c for c in conflict.changes}
+        votes_by_field = defaultdict(list)
+        for vote in conflict.votes:
+            votes_by_field[vote.field_name].append(vote.change_id)
+
+        base_value = conflict.base_value or {}
+        resolved_value = {}
+
+        for field_name in conflict.conflicting_fields or []:
+            field_votes = votes_by_field.get(field_name, [])
+            if not field_votes:
+                resolved_value[field_name] = base_value.get(field_name)
+                continue
+
+            tally = Counter(field_votes)
+            max_votes = max(tally.values())
+            tied = [cid for cid, count in tally.items() if count == max_votes]
+
+            if len(tied) > 1:
+                resolved_value[field_name] = base_value.get(field_name)
+                continue
+
+            winning = changes_by_id.get(tied[0])
+            if not winning or field_name not in (winning.proposed_value or {}):
+                resolved_value[field_name] = base_value.get(field_name)
+                continue
+
+            resolved_value[field_name] = winning.proposed_value[field_name]
+
+        return resolved_value
+    
+    def resolve_conflict(self, conflict_id: str, user_id: str):
+        conflict = (self.db.query(ProjectConflict).options(selectinload(ProjectConflict.changes), selectinload(ProjectConflict.votes)).filter(ProjectConflict.id == conflict_id).first())
+        if not conflict:
+            self.db.close()
+            raise HTTPException(status_code=404, detail="Conflict not found")
+
+        is_member = self.db.query(user_project_association).filter(and_(user_project_association.c.project_id == conflict.project_id, user_project_association.c.user_id == user_id)).first()
+        if not is_member:
+            self.db.close()
+            raise HTTPException(status_code=403, detail="User does not have access to this project")
+
+        if conflict.status == "resolved":
+            self.db.close()
+            raise HTTPException(status_code=409, detail="Conflict has already been resolved")
+
+        conflict.status = "resolved"
+        conflict.resolution_type = "merge"
+        conflict.resolved_value = self._tally_conflict_votes(conflict)
+        conflict.resolved_at = datetime.now()
+
+        self.db.commit()
+        content = {"transactionId": "1", "message": "Conflict resolved successfully","data": {"id": conflict.id, "projectId": conflict.project_id, "modelId": conflict.model_id, "entityType": conflict.entity_type, "entityId": conflict.entity_id, "entityName": conflict.entity_name, "conflictType": conflict.conflict_type, "status": conflict.status, "resolvedValue": conflict.resolved_value, "resolutionType": conflict.resolution_type, "resolvedAt": conflict.resolved_at.isoformat() if conflict.resolved_at else None}}
+        self.db.close()
+        return JSONResponse(content=content, status_code=200)
+    
+    def auto_resolve_expired_conflicts(self):
+        now = datetime.now()
+        expired = (self.db.query(ProjectConflict).options(selectinload(ProjectConflict.changes), selectinload(ProjectConflict.votes)).filter(ProjectConflict.status == "pending", ProjectConflict.expires_at <= now).all())
+
+        resolved_count = 0
+        for conflict in expired:
+            conflict.status = "resolved"
+            conflict.resolution_type = "auto_majority"
+            conflict.resolved_value = self._tally_conflict_votes(conflict)
+            conflict.resolved_at = now
+            resolved_count += 1
+
+        self.db.commit()
+        self.db.close()
+        return {"message": f"Auto-resolved {resolved_count} expired conflict(s)"}
 

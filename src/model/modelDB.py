@@ -10,9 +10,11 @@ from sqlalchemy import (
     MetaData,
     DateTime,
     Integer,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import relationship
 from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.dialects.postgresql import ARRAY
 
 metadata = MetaData(schema="variamos")
 Base = declarative_base(metadata=metadata)
@@ -71,6 +73,12 @@ class Project(Base):
         back_populates="project",
         cascade="all, delete-orphan",
     )
+    
+    conflicts = relationship(
+        "ProjectConflict",
+        back_populates="project_ref",
+        cascade="all, delete-orphan",
+    )
 
 class Model(Base):
     __tablename__ = "model"
@@ -127,6 +135,12 @@ class Model(Base):
         back_populates="model_ref",
         cascade="all, delete-orphan",
     )
+    
+    conflicts = relationship(
+       "ProjectConflict",
+       back_populates="model_ref",
+       cascade="all, delete-orphan",
+    )
 
 class ModelConfiguration(Base):
     __tablename__ = "model_configuration"
@@ -178,6 +192,16 @@ class User(Base):
     annotations = relationship(
         "ProjectAnnotation",
         back_populates="user_ref",
+    )
+    
+    proposed_changes = relationship(
+        "ProjectConflictChange",
+        back_populates="user_ref",
+    )
+
+    conflict_votes = relationship(
+        "ProjectConflictVote",
+        back_populates="voter_ref",
     )
 
 
@@ -333,4 +357,222 @@ class Language(Base):
     models = relationship(
         "Model",
         back_populates="language"
+    )
+    
+class ProjectConflict(Base):
+    __tablename__ = "project_conflict"
+    __table_args__ = {"schema": "variamos"}
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid4()))
+
+    project_id = Column(
+        String,
+        ForeignKey("variamos.project.id"),
+        nullable=False,
+    )
+
+    model_id = Column(
+        String,
+        ForeignKey("variamos.model.id"),
+        nullable=False,
+    )
+
+    entity_type = Column(
+        String,
+        nullable=False,
+    )
+
+    entity_id = Column(
+        String,
+        nullable=False,
+    )
+
+    entity_name = Column(
+        String,
+        nullable=True,
+    )
+
+    conflict_type = Column(
+        String,
+        nullable=False,
+    )
+
+    status = Column(
+        String,
+        nullable=False,
+        default="pending",
+    )
+
+    base_value = Column(
+        JSON,
+        nullable=True,
+    )
+
+    conflicting_fields = Column(
+        ARRAY(String),
+        nullable=False,
+        default=list,
+    )
+
+    resolved_value = Column(
+        JSON,
+        nullable=True,
+    )
+
+    resolution_type = Column(
+        String,
+        nullable=True,
+    )
+
+    created_at = Column(
+        DateTime,
+        nullable=False,
+        server_default=func.now(),
+    )
+    
+    expires_at = Column(
+        DateTime, 
+        nullable=False
+    )
+
+    resolved_at = Column(
+        DateTime,
+        nullable=True,
+    )
+
+    project_ref = relationship(
+        "Project",
+        back_populates="conflicts",
+    )
+
+    model_ref = relationship(
+        "Model",
+        back_populates="conflicts",
+    )
+
+    changes = relationship(
+        "ProjectConflictChange",
+        back_populates="conflict_ref",
+        cascade="all, delete-orphan",
+    )
+
+    votes = relationship(
+        "ProjectConflictVote",
+        back_populates="conflict_ref",
+        cascade="all, delete-orphan",
+    )
+    
+class ProjectConflictChange(Base):
+    __tablename__ = "project_conflict_change"
+    __table_args__ = (
+        UniqueConstraint("conflict_id", "user_id", name="uq_conflict_change_user"),
+        {"schema": "variamos"},
+    )
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid4()))
+
+    conflict_id = Column(
+        String,
+        ForeignKey("variamos.project_conflict.id"),
+        nullable=False,
+    )
+
+    user_id = Column(
+        String,
+        ForeignKey("variamos.user.id"),
+        nullable=False,
+    )
+
+    proposed_value = Column(
+        JSON,
+        nullable=False,
+    )
+
+    operation = Column(
+        JSON,
+        nullable=False,
+    )
+
+    created_at = Column(
+        DateTime,
+        nullable=False,
+        server_default=func.now(),
+    )
+
+    conflict_ref = relationship(
+        "ProjectConflict",
+        back_populates="changes",
+    )
+
+    user_ref = relationship(
+        "User",
+        back_populates="proposed_changes",
+    )
+
+    votes = relationship(
+        "ProjectConflictVote",
+        back_populates="change_ref",
+    )
+
+
+class ProjectConflictVote(Base):
+    __tablename__ = "project_conflict_vote"
+    __table_args__ = (
+        UniqueConstraint(
+            "conflict_id", "field_name", "voter_user_id",
+            name="uq_conflict_vote_user_field",
+        ),
+        {"schema": "variamos"},
+    )
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid4()))
+
+    conflict_id = Column(
+        String,
+        ForeignKey("variamos.project_conflict.id"),
+        nullable=False,
+    )
+
+    field_name = Column(
+        String,
+        nullable=False,
+    )
+
+    voter_user_id = Column(
+        String,
+        ForeignKey("variamos.user.id"),
+        nullable=False,
+    )
+
+    change_id = Column(
+        String,
+        ForeignKey("variamos.project_conflict_change.id"),
+        nullable=False,
+    )
+
+    created_at = Column(
+        DateTime,
+        nullable=False,
+        server_default=func.now(),
+    )
+
+    updated_at = Column(
+        DateTime,
+        nullable=True,
+        onupdate=func.now(),
+    )
+    
+    conflict_ref = relationship(
+        "ProjectConflict",
+        back_populates="votes",
+    )
+
+    voter_ref = relationship(
+        "User",
+        back_populates="conflict_votes",
+    )
+
+    change_ref = relationship(
+        "ProjectConflictChange",
+        back_populates="votes",
     )
