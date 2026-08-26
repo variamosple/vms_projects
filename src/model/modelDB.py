@@ -47,6 +47,7 @@ class Project(Base):
 
     type_models = Column(String, nullable=True)
     is_collaborative = Column(Boolean, default=True, nullable=False)
+    is_deleted = Column(Boolean, default=False, nullable=False)
 
     owner = relationship("User", back_populates="owned_projects")
 
@@ -113,6 +114,9 @@ class Model(Base):
     author = Column(String, nullable=True)
     source = Column(String, nullable=True)    
     model = Column(JSON, nullable=False)
+    is_deleted = Column(Boolean, default=False, nullable=False)
+    model_level = Column(String, default="domain", nullable=True)
+    is_public = Column(Boolean, default=True, nullable=False)
 
     configurations = relationship(
         "ModelConfiguration",
