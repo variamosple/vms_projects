@@ -718,7 +718,7 @@ async def iniciar_app():
         if not _openrouter_keys:
             logger.warning("No OpenRouter keys configured (proxy will fail).")
 
-        timeout = httpx.Timeout(connect=10.0, read=65.0, write=10.0, pool=10.0)
+        timeout = httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0)
         limits = httpx.Limits(max_connections=50, max_keepalive_connections=20)
         _openrouter_client = httpx.AsyncClient(timeout=timeout, limits=limits, http2=False)
         logger.info("OpenRouter client initialized.")
@@ -962,7 +962,7 @@ from collections import deque
 
 OPENROUTER_MAX_CONCURRENCY = 3   
 OPENROUTER_MAX_ATTEMPTS = 1      
-OPENROUTER_MAX_TOTAL_WAIT_S = 60 
+OPENROUTER_MAX_TOTAL_WAIT_S = 300
 OPENROUTER_FREE_RPM = 10         
 OPENROUTER_FREE_GLOBAL_RPM = 20  
 
