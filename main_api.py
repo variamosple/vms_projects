@@ -123,7 +123,7 @@ async def _ensure_openrouter_initialized():
                         ", ".join(_mask_key(k) for k in _openrouter_keys))
 
         if _openrouter_client is None:
-            timeout = httpx.Timeout(connect=10.0, read=65.0, write=10.0, pool=10.0)
+            timeout = httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=10.0)
             limits = httpx.Limits(max_connections=50, max_keepalive_connections=20)
             _openrouter_client = httpx.AsyncClient(timeout=timeout, limits=limits, http2=True)
             logger.info("OpenRouter client initialized.")
@@ -544,7 +544,7 @@ async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request)
             wait_s = _retry_after_seconds(resp) or 8.0
 
             if _is_provider_upstream_429(body):
-                # ✅ FIX: NO enfriar key; enfriar modelo
+                #  FIX: NO enfriar key; enfriar modelo
                 _mark_model_cooldown(model, wait_s)
             else:
                 # 429 más "clásico" (por key / gateway): enfriar key + modelo
@@ -718,7 +718,7 @@ async def iniciar_app():
         if not _openrouter_keys:
             logger.warning("No OpenRouter keys configured (proxy will fail).")
 
-        timeout = httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0)
+        timeout = httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=10.0)
         limits = httpx.Limits(max_connections=50, max_keepalive_connections=20)
         _openrouter_client = httpx.AsyncClient(timeout=timeout, limits=limits, http2=False)
         logger.info("OpenRouter client initialized.")
