@@ -29,7 +29,8 @@ from src.model.modelDAO import UserDao, ProjectDao
 from pydantic import BaseModel, Field
 from src.infrastructure.entry_points import (
     projects_admin_controller_v1,
-    models_admin_controller_v1
+    models_admin_controller_v1,
+    health_controller
 )
 
 
@@ -639,6 +640,7 @@ app.add_middleware(
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 app.add_exception_handler(VariamosSecurityException, variamos_security_exception_handler)
+app.include_router(health_controller)
 app.include_router(projects_admin_controller_v1)
 app.include_router(models_admin_controller_v1)
 

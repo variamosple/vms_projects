@@ -1,2 +1,3 @@
 from .projects_admin_controller_v1 import router as projects_admin_controller_v1
 from .models_admin_controller_v1 import router as models_admin_controller_v1
+from .health_controller import health_router as health_controller
