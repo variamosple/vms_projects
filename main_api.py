@@ -1361,6 +1361,20 @@ async def _call_provider(payload: Dict[str, Any], request: Request, provider: st
 
         body = safe_json(resp)
 
+        # DEBUG: Log DeepSeek response structure
+        if isinstance(body, dict):
+            logger.info("[deepseek][RECV] body_keys=%s", list(body.keys()))
+            if "choices" in body and body["choices"]:
+                c0 = body["choices"][0]
+                if isinstance(c0, dict):
+                    logger.info("[deepseek][RECV] choice0_keys=%s", list(c0.keys()))
+                    if "message" in c0:
+                        msg = c0["message"]
+                        if isinstance(msg, dict):
+                            logger.info("[deepseek][RECV] message_keys=%s", list(msg.keys()))
+                            if "content" in msg:
+                                logger.info("[deepseek][RECV] content_type=%s content_preview=%s", type(msg["content"]), str(msg["content"])[:100])
+
         if resp.status_code != 200:
             raise HTTPException(
                 status_code=resp.status_code,
