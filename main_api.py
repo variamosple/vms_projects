@@ -1298,6 +1298,7 @@ async def _openrouter_has_available_keys() -> bool:
 
 async def _call_provider(payload: Dict[str, Any], request: Request, provider: str) -> Dict[str, Any]:
     """Call the appropriate provider based on provider name."""
+    global _deepseek_last_idx
     if provider == "deepseek":
         await _ensure_deepseek_initialized()
         if not _deepseek_keys:
