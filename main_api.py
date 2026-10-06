@@ -826,6 +826,15 @@ async def iniciar_app():
         _openrouter_keys = []
         logger.exception(f"OpenRouter init failed (service will still run): {e}")
     await _ensure_openrouter_initialized()
+
+    # Initialize DeepSeek client
+    global _deepseek_client
+    try:
+        await _ensure_deepseek_initialized()
+        logger.info("DeepSeek client initialized.")
+    except Exception as e:
+        _deepseek_client = None
+        logger.exception(f"DeepSeek init failed (service will still run): {e}")
     
     global _conflict_auto_resolve_task
     _conflict_auto_resolve_task = asyncio.create_task(run_conflict_auto_resolve_loop())
@@ -834,20 +843,32 @@ async def iniciar_app():
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    global _openrouter_client, _conflict_auto_resolve_task
+    global _openrouter_client, _deepseek_client, _conflict_auto_resolve_task
     try:
         if _openrouter_client is not None:
             await _openrouter_client.aclose()
     finally:
-        if _conflict_auto_resolve_task is not None:
-            _conflict_auto_resolve_task.cancel()
-        close_db()
-
+        try:
+            if _deepseek_client is not None:
+                await _deepseek_client.aclose()
+        finally:
+            if _conflict_auto_resolve_task is not None:
+                _conflict_auto_resolve_task.cancel()
+            close_db()
 
 
 def close_db():
-    db = SessionLocal()  # Aquí obtienes la sesión
-    db.close()
+    global user_DAO, project_DAO
+    try:
+        if user_DAO is not None and user_DAO.db is not None:
+            user_DAO.db.close()
+    except Exception:
+        pass
+    try:
+        if project_DAO is not None and project_DAO.db is not None:
+            project_DAO.db.close()
+    except Exception:
+        pass
 
 
 @app.get("/getUser", dependencies=[Depends(is_authenticated)])
