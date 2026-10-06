@@ -99,6 +99,27 @@ def _load_openrouter_keys() -> List[str]:
               or "").strip()
     return [single] if single else []
 
+
+# DeepSeek direct API
+DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
+_deepseek_keys: List[str] = []
+_deepseek_key_state: Dict[str, Dict[str, Any]] = {}  # {key: {"cooldown_until": float, "disabled_until": float}}
+_deepseek_last_idx: int = 0
+_deepseek_client: Optional[httpx.AsyncClient] = None
+_deepseek_init_lock = asyncio.Lock()
+
+
+def _load_deepseek_keys() -> List[str]:
+    raw = (os.getenv("VARIAMOS_DEEPSEEK_API_KEYS") or "").strip()
+
+    if raw:
+        keys = [k.strip() for k in raw.split(",") if k.strip()]
+        return keys
+
+    single = (os.getenv("VARIAMOS_DEEPSEEK_API_KEY") or "").strip()
+    return [single] if single else []
+
+
 OPENROUTER_KEYINFO_URL = "https://openrouter.ai/api/v1/key"
 _openrouter_init_lock = asyncio.Lock()
 
@@ -151,6 +172,86 @@ def _mark_disabled(api_key: str, seconds: float):
     now = time.time()
     st = _openrouter_key_state.setdefault(api_key, {})
     st["disabled_until"] = max(float(st.get("disabled_until", 0.0) or 0.0), now + max(0.0, seconds))
+
+
+# DeepSeek key state functions
+def _deepseek_key_available_now(api_key: str, now: float) -> bool:
+    st = _deepseek_key_state.get(api_key, {})
+    cooldown_until = float(st.get("cooldown_until", 0.0) or 0.0)
+    disabled_until = float(st.get("disabled_until", 0.0) or 0.0)
+    return now >= cooldown_until and now >= disabled_until
+
+
+def _deepseek_mark_cooldown(api_key: str, seconds: float):
+    now = time.time()
+    st = _deepseek_key_state.setdefault(api_key, {})
+    st["cooldown_until"] = max(float(st.get("cooldown_until", 0.0) or 0.0), now + max(0.0, seconds))
+
+
+def _deepseek_mark_disabled(api_key: str, seconds: float):
+    now = time.time()
+    st = _deepseek_key_state.setdefault(api_key, {})
+    st["disabled_until"] = max(float(st.get("disabled_until", 0.0) or 0.0), now + max(0.0, seconds))
+
+
+def _deepseek_seconds_until_any_key_available(now: float) -> float:
+    waits = []
+    for k in _deepseek_keys:
+        st = _deepseek_key_state.get(k, {})
+        cd = float(st.get("cooldown_until", 0.0) or 0.0)
+        dis = float(st.get("disabled_until", 0.0) or 0.0)
+        until = max(cd, dis)
+        if until > now:
+            waits.append(until - now)
+    return min(waits) if waits else 0.0
+
+
+def _deepseek_limiter_for_key(api_key: str) -> SlidingWindowRateLimiter:
+    lim = _deepseek_free_limiters.get(api_key)
+    if lim is None:
+        lim = SlidingWindowRateLimiter(DEEPSEEK_FREE_RPM, 60.0)
+        _deepseek_free_limiters[api_key] = lim
+    return lim
+
+
+async def _pick_deepseek_key_round_robin(now: float) -> Optional[str]:
+    global _deepseek_last_idx
+
+    if not _deepseek_keys:
+        return None
+
+    n = len(_deepseek_keys)
+
+    async with _deepseek_rr_lock:
+        start = _deepseek_last_idx % n
+        for i in range(n):
+            k = _deepseek_keys[(start + i) % n]
+            if _deepseek_key_available_now(k, now):
+                _deepseek_last_idx = (start + i + 1) % n
+                return k
+
+    return None
+
+
+async def _ensure_deepseek_initialized():
+    global _deepseek_keys, _deepseek_client
+
+    if _deepseek_keys and _deepseek_client is not None:
+        return
+
+    async with _deepseek_init_lock:
+        if not _deepseek_keys:
+            _deepseek_keys = _load_deepseek_keys()
+            logger.info("DeepSeek keys loaded: %d [%s]",
+                        len(_deepseek_keys),
+                        ", ".join(_mask_key(k) for k in _deepseek_keys))
+
+        if _deepseek_client is None:
+            timeout = httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=10.0)
+            limits = httpx.Limits(max_connections=50, max_keepalive_connections=20)
+            _deepseek_client = httpx.AsyncClient(timeout=timeout, limits=limits, http2=True)
+            logger.info("DeepSeek client initialized.")
+
 
 def _retry_after_seconds(resp: httpx.Response) -> float:
     ra = resp.headers.get("retry-after")
@@ -998,6 +1099,16 @@ class SlidingWindowRateLimiter:
 _free_rpm_limiters: Dict[str, SlidingWindowRateLimiter] = {}
 _free_global_limiter = SlidingWindowRateLimiter(OPENROUTER_FREE_GLOBAL_RPM, 60.0)
 
+# DeepSeek rate limiting (same pattern as OpenRouter)
+DEEPSEEK_MAX_CONCURRENCY = 3
+DEEPSEEK_FREE_RPM = 10
+DEEPSEEK_FREE_GLOBAL_RPM = 20
+
+_deepseek_sem = asyncio.Semaphore(DEEPSEEK_MAX_CONCURRENCY)
+_deepseek_rr_lock = asyncio.Lock()
+_deepseek_free_limiters: Dict[str, SlidingWindowRateLimiter] = {}
+_deepseek_free_global_limiter = SlidingWindowRateLimiter(DEEPSEEK_FREE_GLOBAL_RPM, 60.0)
+
 def _limiter_for_key(api_key: str) -> SlidingWindowRateLimiter:
     lim = _free_rpm_limiters.get(api_key)
     if lim is None:
@@ -1040,6 +1151,35 @@ async def debug_openrouter():
         "keys_loaded": len(_openrouter_keys),
         "client_ready": _openrouter_client is not None,
         "keys": info,
+    }
+
+
+@router.get("/_debug/deepseek", dependencies=[Depends(is_authenticated)])
+async def debug_deepseek():
+    await _ensure_deepseek_initialized()
+    info = []
+    for k in _deepseek_keys:
+        try:
+            r = {"status": "configured", "note": "DeepSeek has no key validation endpoint"}
+        except Exception as e:
+            r = {"status": "error", "body": str(e)}
+        info.append({"key": _mask_key(k), "check": r})
+    return {
+        "keys_loaded": len(_deepseek_keys),
+        "client_ready": _deepseek_client is not None,
+        "keys": info,
+        "rate_limits": {
+            "free_rpm_per_key": DEEPSEEK_FREE_RPM,
+            "free_global_rpm": DEEPSEEK_FREE_GLOBAL_RPM,
+            "max_concurrency": DEEPSEEK_MAX_CONCURRENCY,
+        },
+        "key_states": {
+            _mask_key(k): {
+                "cooldown_until": st.get("cooldown_until", 0),
+                "disabled_until": st.get("disabled_until", 0),
+            }
+            for k, st in _deepseek_key_state.items()
+        }
     }
 
 def safe_json(resp: httpx.Response):
@@ -1212,6 +1352,100 @@ def extract_text_content(data: dict) -> str:
 
     return ""
 
+
+async def _call_provider(payload: Dict[str, Any], request: Request, provider: str) -> Dict[str, Any]:
+    """Call the appropriate provider based on provider name."""
+    if provider == "deepseek":
+        await _ensure_deepseek_initialized()
+        if not _deepseek_keys:
+            raise HTTPException(status_code=500, detail={"error": {"message": "DeepSeek API key not configured"}})
+
+        model = payload.get("model", "")
+        if not isinstance(model, str) or not model.strip():
+            raise HTTPException(status_code=400, detail={"error": {"message": "Missing 'model' in payload"}})
+        model = model.strip()
+
+        # Pick key round-robin
+        now_epoch = time.time()
+        api_key = await _pick_deepseek_key_round_robin(now_epoch)
+        if not api_key:
+            wait_s = _deepseek_seconds_until_any_key_available(now_epoch) or 1.0
+            raise HTTPException(
+                status_code=429,
+                detail={"error": {"message": "No DeepSeek API key available (cooldown/disabled)", "retryAfter": wait_s}},
+                headers={"Retry-After": str(int(max(1.0, wait_s)))},
+            )
+
+        # Rate limiting for free models
+        is_free = model.endswith(":free")
+        if is_free:
+            await _deepseek_free_global_limiter.acquire()
+            await _deepseek_limiter_for_key(api_key).acquire()
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        }
+        logger.info("[deepseek][SEND] model=%s key=%s", model, _mask_key(api_key))
+        logger.debug("[deepseek][SEND] payload=%s", payload)
+
+        try:
+            async with _deepseek_sem:
+                resp = await _deepseek_client.post(DEEPSEEK_URL, json=payload, headers=headers)
+        except httpx.TimeoutException as e:
+            _deepseek_mark_cooldown(api_key, 3.0)
+            logger.exception("[deepseek][RECV] TIMEOUT key=%s err=%s", _mask_key(api_key), str(e))
+            raise HTTPException(status_code=504, detail={"error": {"message": "DeepSeek timeout", "exception": str(e)}})
+        except httpx.RequestError as e:
+            _deepseek_mark_cooldown(api_key, 3.0)
+            logger.exception("[deepseek][RECV] NETWORK_ERROR key=%s err=%s", _mask_key(api_key), str(e))
+            raise HTTPException(status_code=502, detail={"error": {"message": "Network error to DeepSeek", "exception": str(e)}})
+
+        raw_text = resp.text
+        logger.info("[deepseek][RECV] status=%s model=%s key=%s retry-after=%s",
+                    resp.status_code, model, _mask_key(api_key), resp.headers.get("retry-after"))
+        logger.debug("[deepseek][RECV] body_raw=%s", raw_text)
+
+        body = safe_json(resp)
+
+        if resp.status_code != 200:
+            # Handle rate limits similar to OpenRouter
+            if resp.status_code == 429:
+                wait_s = _retry_after_seconds(resp) or 8.0
+                _deepseek_mark_cooldown(api_key, wait_s)
+                if is_free:
+                    _mark_model_cooldown(model, wait_s)
+
+                raise HTTPException(
+                    status_code=429,
+                    detail={
+                        "error": {"message": "DeepSeek rate limit", "status": 429, "model": model, "retryAfter": wait_s},
+                        "upstream": body,
+                    },
+                    headers={"Retry-After": str(int(max(1.0, wait_s)))},
+                )
+
+            raise HTTPException(
+                status_code=resp.status_code,
+                detail={
+                    "error": {"message": "DeepSeek error", "status": resp.status_code, "model": model},
+                    "upstream": body,
+                },
+            )
+
+        return body
+    else:
+        # OpenRouter (existing logic)
+        return await call_openrouter_best_effort(payload, request)
+
+
+def _detect_provider(model: str) -> str:
+    """Detect provider from model ID."""
+    if isinstance(model, str) and model.startswith("deepseek/"):
+        return "deepseek"
+    return "openrouter"
+
+
 @router.post("/chat", response_model=AIChatResult)
 async def chat(request: Request, req: AIChatRequest):
     model = req.primaryModelId
@@ -1227,17 +1461,16 @@ async def chat(request: Request, req: AIChatRequest):
     if stable_user:
         payload["user"] = stable_user
 
-    data = await call_openrouter_best_effort(payload, request)
+    provider = _detect_provider(model)
+    data = await _call_provider(payload, request, provider)
 
     content = extract_text_content(data)
     used_model = extract_used_model(data, fallback=model)
 
     if not (content or "").strip():
-        raise HTTPException(status_code=502, detail={"error": "Empty content from OpenRouter", "usedModelId": used_model})
+        raise HTTPException(status_code=502, detail={"error": f"Empty content from {provider}", "usedModelId": used_model})
 
     return {"content": content, "usedModelId": used_model}
-
-
 
 
 app.include_router(router)
