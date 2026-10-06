@@ -85,6 +85,14 @@ _conflict_auto_resolve_task: Optional[asyncio.Task] = None
 _openrouter_model_state: Dict[str, float] = {} 
 _model_lock = asyncio.Lock()
 
+# DeepSeek (same pattern as OpenRouter)
+DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
+_deepseek_keys: List[str] = []
+_deepseek_key_state: Dict[str, Dict[str, Any]] = {}  # {key: {"cooldown_until": float, "disabled_until": float}}
+_deepseek_last_idx: int = 0
+_deepseek_client: Optional[httpx.AsyncClient] = None
+_deepseek_init_lock = asyncio.Lock()
+
 def _load_openrouter_keys() -> List[str]:
     raw = (os.getenv("VARIAMOS_OPENROUTER_API_KEYS")
            or os.getenv("OPENROUTER_API_KEYS")
@@ -98,6 +106,22 @@ def _load_openrouter_keys() -> List[str]:
               or os.getenv("OPENROUTER_API_KEY")
               or "").strip()
     return [single] if single else []
+
+
+def _load_deepseek_keys() -> List[str]:
+    raw = (os.getenv("VARIAMOS_DEEPSEEK_API_KEYS")
+           or os.getenv("DEEPSEEK_API_KEYS")
+           or "").strip()
+
+    if raw:
+        keys = [k.strip() for k in raw.split(",") if k.strip()]
+        return keys
+
+    single = (os.getenv("VARIAMOS_DEEPSEEK_API_KEY")
+              or os.getenv("DEEPSEEK_API_KEY")
+              or "").strip()
+    return [single] if single else []
+
 
 OPENROUTER_KEYINFO_URL = "https://openrouter.ai/api/v1/key"
 _openrouter_init_lock = asyncio.Lock()
@@ -128,6 +152,26 @@ async def _ensure_openrouter_initialized():
             limits = httpx.Limits(max_connections=50, max_keepalive_connections=20)
             _openrouter_client = httpx.AsyncClient(timeout=timeout, limits=limits, http2=True)
             logger.info("OpenRouter client initialized.")
+
+
+async def _ensure_deepseek_initialized():
+    global _deepseek_keys, _deepseek_client
+
+    if _deepseek_keys and _deepseek_client is not None:
+        return
+
+    async with _deepseek_init_lock:
+        if not _deepseek_keys:
+            _deepseek_keys = _load_deepseek_keys()
+            logger.info("DeepSeek keys loaded: %d [%s]",
+                        len(_deepseek_keys),
+                        ", ".join(_mask_key(k) for k in _deepseek_keys))
+
+        if _deepseek_client is None:
+            timeout = httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=10.0)
+            limits = httpx.Limits(max_connections=50, max_keepalive_connections=20)
+            _deepseek_client = httpx.AsyncClient(timeout=timeout, limits=limits, http2=True)
+            logger.info("DeepSeek client initialized.")
 
 async def _check_key(api_key: str) -> dict:
     # Verifica que la key realmente sirve
@@ -729,6 +773,23 @@ async def iniciar_app():
         _openrouter_keys = []
         logger.exception(f"OpenRouter init failed (service will still run): {e}")
     await _ensure_openrouter_initialized()
+
+    # Initialize DeepSeek
+    global _deepseek_keys, _deepseek_client
+    try:
+        _deepseek_keys = _load_deepseek_keys()
+        if not _deepseek_keys:
+            logger.warning("No DeepSeek keys configured.")
+
+        timeout = httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=10.0)
+        limits = httpx.Limits(max_connections=50, max_keepalive_connections=20)
+        _deepseek_client = httpx.AsyncClient(timeout=timeout, limits=limits, http2=True)
+        logger.info("DeepSeek client initialized.")
+    except Exception as e:
+        _deepseek_client = None
+        _deepseek_keys = []
+        logger.exception(f"DeepSeek init failed (service will still run): {e}")
+    await _ensure_deepseek_initialized()
     
     global _conflict_auto_resolve_task
     _conflict_auto_resolve_task = asyncio.create_task(run_conflict_auto_resolve_loop())
@@ -737,14 +798,18 @@ async def iniciar_app():
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    global _openrouter_client, _conflict_auto_resolve_task
+    global _openrouter_client, _deepseek_client, _conflict_auto_resolve_task
     try:
         if _openrouter_client is not None:
             await _openrouter_client.aclose()
     finally:
-        if _conflict_auto_resolve_task is not None:
-            _conflict_auto_resolve_task.cancel()
-        close_db()
+        try:
+            if _deepseek_client is not None:
+                await _deepseek_client.aclose()
+        finally:
+            if _conflict_auto_resolve_task is not None:
+                _conflict_auto_resolve_task.cancel()
+            close_db()
 
 
 
@@ -1212,6 +1277,85 @@ def extract_text_content(data: dict) -> str:
 
     return ""
 
+
+def _detect_provider(model: str) -> str:
+    """Detect provider from model ID."""
+    if isinstance(model, str) and model.startswith("deepseek/"):
+        return "deepseek"
+    return "openrouter"
+
+
+async def _call_provider(payload: Dict[str, Any], request: Request, provider: str) -> Dict[str, Any]:
+    """Call the appropriate provider based on provider name."""
+    if provider == "deepseek":
+        await _ensure_deepseek_initialized()
+        if not _deepseek_keys:
+            raise HTTPException(status_code=500, detail={"error": {"message": "DeepSeek API key not configured"}})
+
+        model = payload.get("model", "")
+        if not isinstance(model, str) or not model.strip():
+            raise HTTPException(status_code=400, detail={"error": {"message": "Missing 'model' in payload"}})
+        model = model.strip()
+
+        # Round-robin key selection (same pattern as OpenRouter)
+        now_epoch = time.time()
+        if not _deepseek_keys:
+            raise HTTPException(status_code=500, detail={"error": {"message": "No DeepSeek keys configured"}})
+        
+        n = len(_deepseek_keys)
+        async with _deepseek_init_lock:  # reuse lock for simplicity
+            start = _deepseek_last_idx % n
+            for i in range(n):
+                k = _deepseek_keys[(start + i) % n]
+                st = _deepseek_key_state.get(k, {})
+                cooldown_until = float(st.get("cooldown_until", 0.0) or 0.0)
+                disabled_until = float(st.get("disabled_until", 0.0) or 0.0)
+                if now_epoch >= cooldown_until and now_epoch >= disabled_until:
+                    _deepseek_last_idx = (start + i + 1) % n
+                    api_key = k
+                    break
+            else:
+                api_key = None
+        
+        if not api_key:
+            raise HTTPException(status_code=429, detail={"error": {"message": "No DeepSeek key available"}})
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        }
+        logger.info("[deepseek][SEND] model=%s key=%s", model, _mask_key(api_key))
+        logger.debug("[deepseek][SEND] payload=%s", payload)
+
+        try:
+            resp = await _deepseek_client.post(DEEPSEEK_URL, json=payload, headers=headers)
+        except httpx.TimeoutException as e:
+            logger.exception("[deepseek][RECV] TIMEOUT key=%s err=%s", _mask_key(api_key), str(e))
+            raise HTTPException(status_code=504, detail={"error": {"message": "DeepSeek timeout", "exception": str(e)}})
+        except httpx.RequestError as e:
+            logger.exception("[deepseek][RECV] NETWORK_ERROR key=%s err=%s", _mask_key(api_key), str(e))
+            raise HTTPException(status_code=502, detail={"error": {"message": "Network error to DeepSeek", "exception": str(e)}})
+
+        raw_text = resp.text
+        logger.info("[deepseek][RECV] status=%s model=%s key=%s retry-after=%s",
+                    resp.status_code, model, _mask_key(api_key), resp.headers.get("retry-after"))
+        logger.debug("[deepseek][RECV] body_raw=%s", raw_text)
+
+        body = safe_json(resp)
+
+        if resp.status_code != 200:
+            raise HTTPException(
+                status_code=resp.status_code,
+                detail={
+                    "error": {"message": "DeepSeek error", "status": resp.status_code, "model": model},
+                    "upstream": body,
+                },
+            )
+        return body
+    else:
+        return await call_openrouter_best_effort(payload, request)
+
+
 @router.post("/chat", response_model=AIChatResult)
 async def chat(request: Request, req: AIChatRequest):
     model = req.primaryModelId
@@ -1227,17 +1371,16 @@ async def chat(request: Request, req: AIChatRequest):
     if stable_user:
         payload["user"] = stable_user
 
-    data = await call_openrouter_best_effort(payload, request)
+    provider = _detect_provider(model)
+    data = await _call_provider(payload, request, provider)
 
     content = extract_text_content(data)
     used_model = extract_used_model(data, fallback=model)
 
     if not (content or "").strip():
-        raise HTTPException(status_code=502, detail={"error": "Empty content from OpenRouter", "usedModelId": used_model})
+        raise HTTPException(status_code=502, detail={"error": f"Empty content from {provider}", "usedModelId": used_model})
 
     return {"content": content, "usedModelId": used_model}
-
-
 
 
 app.include_router(router)
