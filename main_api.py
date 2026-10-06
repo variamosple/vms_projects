@@ -1285,6 +1285,17 @@ def _detect_provider(model: str) -> str:
     return "openrouter"
 
 
+async def _openrouter_has_available_keys() -> bool:
+    """Check if OpenRouter has any available keys (not in cooldown/disabled)."""
+    if not _openrouter_keys:
+        return False
+    now = time.time()
+    for k in _openrouter_keys:
+        if _key_available_now(k, now):
+            return True
+    return False
+
+
 async def _call_provider(payload: Dict[str, Any], request: Request, provider: str) -> Dict[str, Any]:
     """Call the appropriate provider based on provider name."""
     if provider == "deepseek":
@@ -1379,6 +1390,20 @@ async def chat(request: Request, req: AIChatRequest):
         payload["user"] = stable_user
 
     provider = _detect_provider(model)
+    
+    # Fallback: if requesting OpenRouter but no keys available, try DeepSeek
+    if provider == "openrouter" and not await _openrouter_has_available_keys():
+        if _deepseek_keys:
+            provider = "deepseek"
+            # Use a default DeepSeek model if the requested one isn't DeepSeek
+            if model.startswith("deepseek/"):
+                payload["model"] = model
+            else:
+                payload["model"] = "deepseek/deepseek-chat"  # default DeepSeek model
+        else:
+            # No fallback available
+            raise HTTPException(status_code=503, detail={"error": "No AI providers available"})
+
     data = await _call_provider(payload, request, provider)
 
     content = extract_text_content(data)
