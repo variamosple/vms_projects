@@ -1313,6 +1313,15 @@ async def _call_provider(payload: Dict[str, Any], request: Request, provider: st
         if model.startswith("deepseek/"):
             model = model.split("/", 1)[1]
 
+        # Build clean payload for DeepSeek (only known fields, like OpenRouter)
+        deepseek_payload = {
+            "model": model,
+            "messages": payload.get("messages") or [],
+            "stream": False,
+        }
+        if isinstance(payload.get("user"), str) and payload["user"].strip():
+            deepseek_payload["user"] = payload["user"].strip()
+
         # Round-robin key selection (same pattern as OpenRouter)
         now_epoch = time.time()
         if not _deepseek_keys:
@@ -1340,13 +1349,11 @@ async def _call_provider(payload: Dict[str, Any], request: Request, provider: st
             "Content-Type": "application/json",
             "Authorization": f"Bearer {api_key}",
         }
-        # Update payload with stripped model name for DeepSeek API
-        payload["model"] = model
         logger.info("[deepseek][SEND] model=%s key=%s", model, _mask_key(api_key))
-        logger.debug("[deepseek][SEND] payload=%s", payload)
+        logger.debug("[deepseek][SEND] payload=%s", deepseek_payload)
 
         try:
-            resp = await _deepseek_client.post(DEEPSEEK_URL, json=payload, headers=headers)
+            resp = await _deepseek_client.post(DEEPSEEK_URL, json=deepseek_payload, headers=headers)
         except httpx.TimeoutException as e:
             logger.exception("[deepseek][RECV] TIMEOUT key=%s err=%s", _mask_key(api_key), str(e))
             raise HTTPException(status_code=504, detail={"error": {"message": "DeepSeek timeout", "exception": str(e)}})
