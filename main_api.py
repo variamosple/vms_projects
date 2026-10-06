@@ -1297,6 +1297,11 @@ async def _call_provider(payload: Dict[str, Any], request: Request, provider: st
             raise HTTPException(status_code=400, detail={"error": {"message": "Missing 'model' in payload"}})
         model = model.strip()
 
+        # DeepSeek API expects model names without "deepseek/" prefix
+        # e.g., "deepseek/deepseek-chat" -> "deepseek-chat"
+        if model.startswith("deepseek/"):
+            model = model.split("/", 1)[1]
+
         # Round-robin key selection (same pattern as OpenRouter)
         now_epoch = time.time()
         if not _deepseek_keys:
@@ -1324,6 +1329,8 @@ async def _call_provider(payload: Dict[str, Any], request: Request, provider: st
             "Content-Type": "application/json",
             "Authorization": f"Bearer {api_key}",
         }
+        # Update payload with stripped model name for DeepSeek API
+        payload["model"] = model
         logger.info("[deepseek][SEND] model=%s key=%s", model, _mask_key(api_key))
         logger.debug("[deepseek][SEND] payload=%s", payload)
 
