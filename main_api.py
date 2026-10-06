@@ -113,8 +113,6 @@ _deepseek_client: Optional[httpx.AsyncClient] = None
 _deepseek_init_lock = asyncio.Lock()
 _deepseek_sem = asyncio.Semaphore(DEEPSEEK_MAX_CONCURRENCY)
 _deepseek_rr_lock = asyncio.Lock()
-_deepseek_free_limiters: Dict[str, SlidingWindowRateLimiter] = {}
-_deepseek_free_global_limiter = SlidingWindowRateLimiter(DEEPSEEK_FREE_GLOBAL_RPM, 60.0)
 
 
 def _load_deepseek_keys() -> List[str]:
@@ -1093,9 +1091,12 @@ class SlidingWindowRateLimiter:
                 wait_s = self.window_seconds - (now - self._calls[0])
 
             await asyncio.sleep(max(0.0, wait_s))
-
 _free_rpm_limiters: Dict[str, SlidingWindowRateLimiter] = {}
 _free_global_limiter = SlidingWindowRateLimiter(OPENROUTER_FREE_GLOBAL_RPM, 60.0)
+
+_deepseek_free_limiters: Dict[str, SlidingWindowRateLimiter] = {}
+_deepseek_free_global_limiter = SlidingWindowRateLimiter(DEEPSEEK_FREE_GLOBAL_RPM, 60.0)
+
 
 def _limiter_for_key(api_key: str) -> SlidingWindowRateLimiter:
     lim = _free_rpm_limiters.get(api_key)
