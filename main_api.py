@@ -32,6 +32,7 @@ from src.infrastructure.entry_points import (
     models_admin_controller_v1,
     health_controller
 )
+from src.infrastructure.multimodel_validation_controller import router as multimodel_validation_router
 
 
 router = APIRouter(prefix="/api/ai", tags=["ai"])
@@ -687,6 +688,7 @@ app.add_exception_handler(VariamosSecurityException, variamos_security_exception
 app.include_router(health_controller)
 app.include_router(projects_admin_controller_v1)
 app.include_router(models_admin_controller_v1)
+app.include_router(multimodel_validation_router, dependencies=[Depends(is_authenticated)])
 
 def enforce_allowed_web_origin(request: Request):
     if not ALLOWED_ORIGINS_PATTERNS:

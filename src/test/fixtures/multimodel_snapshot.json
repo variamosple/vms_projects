@@ -1,0 +1,82 @@
+{
+  "schemaVersion": 1,
+  "projectId": "demo",
+  "snapshotId": "snapshot-1",
+  "scope": "complete",
+  "project": {
+    "id": "demo",
+    "productLines": [
+      {
+        "id": "line-1",
+        "scope": { "models": [] },
+        "domainEngineering": {
+          "models": [
+            {
+              "id": "domain",
+              "languageId": 7,
+              "elements": [
+                { "id": "shared", "type": "Container", "parentId": null },
+                { "id": "item", "type": "Item", "parentId": "shared" }
+              ],
+              "relationships": [
+                { "id": "r-1", "type": "Contains", "sourceId": "shared", "targetId": "item" }
+              ]
+            }
+          ]
+        },
+        "applicationEngineering": {
+          "models": [],
+          "applications": [
+            {
+              "id": "app-1",
+              "models": [],
+              "adaptations": [
+                {
+                  "id": "adaptation-1",
+                  "models": [
+                    {
+                      "id": "adapted",
+                      "languageId": "8",
+                      "sourceModelIds": ["domain"],
+                      "elements": [
+                        {
+                          "id": "shared",
+                          "type": "Variant",
+                          "sourceModelElements": [
+                            { "modelId": "domain", "elementId": "item" }
+                          ]
+                        },
+                        {
+                          "id": "variant-2",
+                          "type": "Variant",
+                          "sourceModelElements": [
+                            { "modelId": "domain", "elementId": "removed" }
+                          ]
+                        }
+                      ],
+                      "relationships": [
+                        { "id": "r-2", "type": "Pairs", "sourceId": "shared", "targetId": "variant-2" }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "metamodels": {
+    "7": {
+      "abstractSyntax": {
+        "elements": { "Container": {}, "Item": {} },
+        "relationships": { "Contains": { "source": "Container", "target": ["Item"] } }
+      }
+    },
+    "8": {
+      "elements": { "Variant": {} },
+      "relationships": { "Pairs": { "source": "Variant", "target": ["Variant"] } }
+    }
+  }
+}
