@@ -1,9 +1,12 @@
 # Only the code goes into the image. The settings come from the server
 # (compose), never from a file: an image on Docker Hub is readable by anyone.
+#
+# credentials.json is not listed: db_connector.py opens it at start-up. It is
+# not in git, production mounts it, and the end-to-end tests of VariaMosAdmin
+# write an empty {} one before they build this image.
 .env
 .env.*
 *.env
-credentials.json
 *.key
 *.pem
 
