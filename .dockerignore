@@ -1,0 +1,21 @@
+# Only the code goes into the image. The settings come from the server
+# (compose), never from a file: an image on Docker Hub is readable by anyone.
+.env
+.env.*
+*.env
+credentials.json
+*.key
+*.pem
+
+# Local tools and caches
+.git
+.github
+.idea
+.vscode
+venv/
+.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+*.http

@@ -1,0 +1,21 @@
+# Builds, checks and deploys the service with the shared workflow of the
+# organization: https://github.com/variamosple/.github
+#
+# No .env is written: the database settings, the AI keys and the allowed
+# origins come from the server (compose), so the public image holds none.
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    uses: variamosple/.github/.github/workflows/deploy.yml@v1
+    with:
+      image: vms_projects
+      service: vms_projects
+      health-url: https://app.variamos.com/vms_projects/health
+      health-name: vms_projects
+    secrets: inherit
