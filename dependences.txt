@@ -10,4 +10,4 @@ uvicorn
 httpx[http2]
 docker
 pytest
-variamos-security
+variamos-security==0.0.4
