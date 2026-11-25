@@ -168,7 +168,41 @@ class ProjectDao:
                 )
             )
 
-    
+    def _sync_models(self, project_id: str, models: list):
+        """Align the stored models of a project with the models sent.
+
+        Deleting every model and inserting them again also deleted their
+        configurations (ON DELETE CASCADE in the database) and reset the
+        columns the request does not carry (is_deleted, model_level,
+        is_public, description, author, source). Only the models missing
+        from the request are deleted now; the others are updated in place.
+        """
+        incoming_ids = [model["id"] for model in models]
+
+        self.db.query(Model).filter(
+            Model.project_id == project_id,
+            Model.id.not_in(incoming_ids),
+        ).delete(synchronize_session=False)
+
+        existing = {
+            model.id: model
+            for model in self.db.query(Model).filter(Model.project_id == project_id)
+        }
+
+        new_models = []
+        for model in models:
+            stored = existing.get(model["id"])
+            if stored is None:
+                new_models.append(model)
+                continue
+            stored.product_line_id = model["product_line_id"]
+            stored.engineering_type = model["engineering_type"]
+            stored.language_id = model["language_id"]
+            stored.name = model["name"]
+            stored.type = model["type"]
+            stored.model = model["model"]
+
+        self._save_models(project_id, new_models)
 
     def get_by_id(self, user_id: str, project_id: str):
         project = (
@@ -375,25 +409,29 @@ class ProjectDao:
             raise Exception("El usuario no existe")
 
         project_id = project_dict.get("id")
-        project_json, extracted_models = self._extract_models(
-            project_dict.get("project")
-        )
 
-        self.db.query(Project).filter(Project.id == project_id).update({
-            "name": project_dict.get("name"),
-            "project": project_json,
-            "template": project_dict.get("template"),
-            "description": project_dict.get("description"),
-            "author": project_dict.get("author"),
-            "source": project_dict.get("source"),
-            "date": datetime.now(),
-        })
+        # Only the fields sent by the client are written: a missing key keeps
+        # the stored value instead of becoming NULL.
+        values = {
+            field: project_dict[field]
+            for field in ("name", "template", "description", "author", "source")
+            if field in project_dict
+        }
+        extracted_models = None
+        if "project" in project_dict:
+            values["project"], extracted_models = self._extract_models(
+                project_dict["project"]
+            )
+        values["date"] = datetime.now()
 
-        self.db.query(Model).filter(
-            Model.project_id == project_id
-        ).delete()
+        updated = self.db.query(Project).filter(Project.id == project_id).update(values)
+        if updated == 0:
+            self.db.rollback()
+            self.db.close()
+            raise HTTPException(status_code=404, detail="Project not found")
 
-        self._save_models(project_id, extracted_models)
+        if extracted_models is not None:
+            self._sync_models(project_id, extracted_models)
         self.db.commit()
 
         content = { "transactionId": "1", "message": "Project updated successfully", "data": {"id": project_id} }
