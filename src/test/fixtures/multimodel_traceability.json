@@ -1,0 +1,392 @@
+{
+  "schemaVersion": 1,
+  "before": {
+    "schemaVersion": 1,
+    "projectId": "version-demo",
+    "snapshotId": "trace-before",
+    "scope": "complete",
+    "project": {
+      "productLines": [
+        {
+          "scope": {
+            "models": []
+          },
+          "domainEngineering": {
+            "models": [
+              {
+                "id": "base",
+                "languageId": "feature-demo",
+                "name": "Base",
+                "elements": [
+                  {
+                    "id": "catalog",
+                    "type": "Feature",
+                    "name": "Catalogo"
+                  }
+                ],
+                "relationships": []
+              }
+            ]
+          },
+          "applicationEngineering": {
+            "models": [
+              {
+                "id": "derived",
+                "languageId": "component-demo",
+                "name": "Store",
+                "elements": [
+                  {
+                    "id": "service",
+                    "type": "Component",
+                    "name": "ServicioCatalogo"
+                  }
+                ],
+                "relationships": []
+              }
+            ],
+            "applications": []
+          }
+        }
+      ]
+    }
+  },
+  "after": {
+    "schemaVersion": 1,
+    "projectId": "version-demo",
+    "snapshotId": "trace-after",
+    "scope": "complete",
+    "project": {
+      "productLines": [
+        {
+          "scope": {
+            "models": []
+          },
+          "domainEngineering": {
+            "models": [
+              {
+                "id": "base",
+                "languageId": "feature-demo",
+                "name": "Base",
+                "elements": [
+                  {
+                    "id": "catalog",
+                    "type": "Feature",
+                    "name": "CatalogoWeb"
+                  }
+                ],
+                "relationships": []
+              }
+            ]
+          },
+          "applicationEngineering": {
+            "models": [
+              {
+                "id": "derived",
+                "languageId": "component-demo",
+                "name": "Store",
+                "elements": [
+                  {
+                    "id": "service",
+                    "type": "Component",
+                    "name": "ServicioCatalogo"
+                  }
+                ],
+                "relationships": []
+              }
+            ],
+            "applications": []
+          }
+        }
+      ]
+    }
+  },
+  "versionContext": {
+    "schemaVersion": 1,
+    "id": "ecommerce-version-evidence",
+    "projectId": "version-demo",
+    "scope": "complete",
+    "historyScope": "complete",
+    "revisions": [
+      {
+        "modelId": "base",
+        "versionId": "base-v1",
+        "parentVersionIds": [],
+        "scope": "complete",
+        "model": {
+          "id": "base",
+          "languageId": "feature-demo",
+          "name": "Base",
+          "elements": [
+            {
+              "id": "catalog",
+              "type": "Feature",
+              "name": "Catalogo"
+            }
+          ],
+          "relationships": []
+        }
+      },
+      {
+        "modelId": "base",
+        "versionId": "base-v2",
+        "parentVersionIds": [
+          "base-v1"
+        ],
+        "scope": "complete",
+        "model": {
+          "id": "base",
+          "languageId": "feature-demo",
+          "name": "Base",
+          "elements": [
+            {
+              "id": "catalog",
+              "type": "Feature",
+              "name": "CatalogoWeb"
+            }
+          ],
+          "relationships": []
+        }
+      },
+      {
+        "modelId": "derived",
+        "versionId": "store-v1",
+        "parentVersionIds": [],
+        "scope": "complete",
+        "model": {
+          "id": "derived",
+          "languageId": "component-demo",
+          "name": "Store",
+          "elements": [
+            {
+              "id": "service",
+              "type": "Component",
+              "name": "ServicioCatalogo"
+            }
+          ],
+          "relationships": []
+        }
+      }
+    ],
+    "compatibility": [
+      {
+        "id": "compatible-store-base",
+        "source": {
+          "modelId": "derived",
+          "versionId": "store-v1"
+        },
+        "target": {
+          "modelId": "base",
+          "versionId": "base-v2"
+        },
+        "compatible": true
+      }
+    ],
+    "correspondences": [
+      {
+        "id": "store-base",
+        "source": {
+          "modelId": "derived",
+          "versionId": "store-v1",
+          "kind": "element",
+          "id": "service"
+        },
+        "target": {
+          "modelId": "base",
+          "versionId": "base-v2",
+          "kind": "element",
+          "id": "catalog"
+        }
+      }
+    ],
+    "changes": [
+      {
+        "id": "rename-catalog",
+        "projectId": "version-demo",
+        "modelId": "base",
+        "entityType": "element",
+        "entityId": "catalog",
+        "fromVersionId": "base-v1",
+        "toVersionId": "base-v2",
+        "valueScope": "entity",
+        "oldValue": {
+          "id": "catalog",
+          "type": "Feature",
+          "name": "Catalogo"
+        },
+        "newValue": {
+          "id": "catalog",
+          "type": "Feature",
+          "name": "CatalogoWeb"
+        }
+      }
+    ],
+    "historicalReferences": [
+      {
+        "id": "catalog-before-rename",
+        "source": {
+          "modelId": "derived",
+          "versionId": "store-v1",
+          "kind": "element",
+          "id": "service"
+        },
+        "target": {
+          "modelId": "base",
+          "versionId": "base-v1",
+          "kind": "element",
+          "id": "catalog"
+        }
+      }
+    ]
+  },
+  "traceContext": {
+    "schemaVersion": 1,
+    "id": "ecommerce-trace-evidence",
+    "projectId": "version-demo",
+    "scope": "complete",
+    "origins": [
+      {
+        "id": "business-request",
+        "kind": "request",
+        "projectId": "version-demo",
+        "source": "explicit-example"
+      }
+    ],
+    "requirements": [
+      {
+        "id": "catalog-requirement",
+        "projectId": "version-demo",
+        "artifact": {
+          "kind": "artifact",
+          "phase": "after",
+          "entity": {
+            "kind": "element",
+            "modelId": "base",
+            "id": "catalog"
+          }
+        }
+      }
+    ],
+    "history": [
+      {
+        "id": "rename-catalog",
+        "projectId": "version-demo",
+        "modelId": "base",
+        "entityType": "element",
+        "entityId": "catalog",
+        "fromVersionId": "base-v1",
+        "toVersionId": "base-v2",
+        "valueScope": "entity",
+        "oldValue": {
+          "id": "catalog",
+          "type": "Feature",
+          "name": "Catalogo"
+        },
+        "newValue": {
+          "id": "catalog",
+          "type": "Feature",
+          "name": "CatalogoWeb"
+        }
+      }
+    ],
+    "links": [
+      {
+        "id": "change-history",
+        "relation": "recorded-in",
+        "source": {
+          "kind": "change",
+          "index": 0
+        },
+        "target": {
+          "kind": "history",
+          "id": "rename-catalog"
+        }
+      },
+      {
+        "id": "change-origin",
+        "relation": "requested-by",
+        "source": {
+          "kind": "change",
+          "index": 0
+        },
+        "target": {
+          "kind": "origin",
+          "catalog": "attempt",
+          "id": "chat-interaction"
+        }
+      },
+      {
+        "id": "history-artifact",
+        "relation": "affects",
+        "source": {
+          "kind": "history",
+          "id": "rename-catalog"
+        },
+        "target": {
+          "kind": "artifact",
+          "phase": "after",
+          "entity": {
+            "kind": "element",
+            "modelId": "base",
+            "id": "catalog"
+          }
+        }
+      },
+      {
+        "id": "requirement-version",
+        "relation": "related-to",
+        "source": {
+          "kind": "requirement",
+          "id": "catalog-requirement"
+        },
+        "target": {
+          "kind": "version",
+          "modelId": "base",
+          "versionId": "base-v2"
+        }
+      },
+      {
+        "id": "version-model",
+        "relation": "revision-of",
+        "source": {
+          "kind": "version",
+          "modelId": "base",
+          "versionId": "base-v2"
+        },
+        "target": {
+          "kind": "artifact",
+          "phase": "after",
+          "entity": {
+            "kind": "model",
+            "modelId": "base",
+            "id": "base"
+          }
+        }
+      },
+      {
+        "id": "requirement-request",
+        "relation": "related-to",
+        "source": {
+          "kind": "requirement",
+          "id": "catalog-requirement"
+        },
+        "target": {
+          "kind": "origin",
+          "catalog": "context",
+          "id": "business-request"
+        }
+      }
+    ]
+  },
+  "attemptContext": {
+    "schemaVersion": 1,
+    "id": "trace-attempt-1",
+    "projectId": "version-demo",
+    "beforeSnapshotId": "trace-before",
+    "afterSnapshotId": "trace-after",
+    "origin": {
+      "id": "chat-interaction",
+      "kind": "interaction",
+      "source": "chatbot"
+    }
+  }
+}

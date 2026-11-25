@@ -1,0 +1,188 @@
+{
+  "schemaVersion": 1,
+  "projectId": "version-demo",
+  "snapshotId": "version-after",
+  "scope": "complete",
+  "project": {
+    "productLines": [
+      {
+        "scope": {
+          "models": []
+        },
+        "domainEngineering": {
+          "models": [
+            {
+              "id": "base",
+              "languageId": "feature-demo",
+              "name": "Base",
+              "elements": [
+                {
+                  "id": "catalog",
+                  "type": "Feature",
+                  "name": "CatalogoWeb"
+                }
+              ],
+              "relationships": []
+            }
+          ]
+        },
+        "applicationEngineering": {
+          "models": [
+            {
+              "id": "derived",
+              "languageId": "component-demo",
+              "name": "Store",
+              "elements": [
+                {
+                  "id": "service",
+                  "type": "Component",
+                  "name": "ServicioCatalogo"
+                }
+              ],
+              "relationships": []
+            }
+          ],
+          "applications": []
+        }
+      }
+    ]
+  },
+  "versionContext": {
+    "schemaVersion": 1,
+    "id": "ecommerce-version-evidence",
+    "projectId": "version-demo",
+    "scope": "complete",
+    "historyScope": "complete",
+    "revisions": [
+      {
+        "modelId": "base",
+        "versionId": "base-v1",
+        "parentVersionIds": [],
+        "scope": "complete",
+        "model": {
+          "id": "base",
+          "languageId": "feature-demo",
+          "name": "Base",
+          "elements": [
+            {
+              "id": "catalog",
+              "type": "Feature",
+              "name": "Catalogo"
+            }
+          ],
+          "relationships": []
+        }
+      },
+      {
+        "modelId": "base",
+        "versionId": "base-v2",
+        "parentVersionIds": [
+          "base-v1"
+        ],
+        "scope": "complete",
+        "model": {
+          "id": "base",
+          "languageId": "feature-demo",
+          "name": "Base",
+          "elements": [
+            {
+              "id": "catalog",
+              "type": "Feature",
+              "name": "CatalogoWeb"
+            }
+          ],
+          "relationships": []
+        }
+      },
+      {
+        "modelId": "derived",
+        "versionId": "store-v1",
+        "parentVersionIds": [],
+        "scope": "complete",
+        "model": {
+          "id": "derived",
+          "languageId": "component-demo",
+          "name": "Store",
+          "elements": [
+            {
+              "id": "service",
+              "type": "Component",
+              "name": "ServicioCatalogo"
+            }
+          ],
+          "relationships": []
+        }
+      }
+    ],
+    "compatibility": [
+      {
+        "id": "compatible-store-base",
+        "source": {
+          "modelId": "derived",
+          "versionId": "store-v1"
+        },
+        "target": {
+          "modelId": "base",
+          "versionId": "base-v2"
+        },
+        "compatible": true
+      }
+    ],
+    "correspondences": [
+      {
+        "id": "store-base",
+        "source": {
+          "modelId": "derived",
+          "versionId": "store-v1",
+          "kind": "element",
+          "id": "service"
+        },
+        "target": {
+          "modelId": "base",
+          "versionId": "base-v2",
+          "kind": "element",
+          "id": "catalog"
+        }
+      }
+    ],
+    "changes": [
+      {
+        "id": "rename-catalog",
+        "projectId": "version-demo",
+        "modelId": "base",
+        "entityType": "element",
+        "entityId": "catalog",
+        "fromVersionId": "base-v1",
+        "toVersionId": "base-v2",
+        "valueScope": "entity",
+        "oldValue": {
+          "id": "catalog",
+          "type": "Feature",
+          "name": "Catalogo"
+        },
+        "newValue": {
+          "id": "catalog",
+          "type": "Feature",
+          "name": "CatalogoWeb"
+        }
+      }
+    ],
+    "historicalReferences": [
+      {
+        "id": "catalog-before-rename",
+        "source": {
+          "modelId": "derived",
+          "versionId": "store-v1",
+          "kind": "element",
+          "id": "service"
+        },
+        "target": {
+          "modelId": "base",
+          "versionId": "base-v1",
+          "kind": "element",
+          "id": "catalog"
+        }
+      }
+    ]
+  }
+}

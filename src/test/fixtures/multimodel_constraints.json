@@ -1,0 +1,201 @@
+{
+  "schemaVersion": 1,
+  "projectId": "constraint-demo",
+  "snapshotId": "constraints-after",
+  "scope": "complete",
+  "project": {
+    "productLines": [
+      {
+        "scope": {
+          "models": []
+        },
+        "domainEngineering": {
+          "models": [
+            {
+              "id": "feature-model",
+              "languageId": "features-demo",
+              "elements": [
+                {
+                  "id": "catalog",
+                  "type": "Feature",
+                  "properties": [
+                    {
+                      "name": "Selected",
+                      "value": "Selected"
+                    }
+                  ]
+                },
+                {
+                  "id": "payment",
+                  "type": "Feature",
+                  "properties": [
+                    {
+                      "name": "Selected",
+                      "value": "Selected"
+                    }
+                  ]
+                }
+              ],
+              "relationships": []
+            }
+          ]
+        },
+        "applicationEngineering": {
+          "models": [
+            {
+              "id": "component-model",
+              "languageId": "components-demo",
+              "elements": [
+                {
+                  "id": "catalog-service",
+                  "type": "Component",
+                  "attributes": {
+                    "enabled": true
+                  }
+                },
+                {
+                  "id": "payment-service",
+                  "type": "Component",
+                  "attributes": {
+                    "enabled": true
+                  }
+                }
+              ],
+              "relationships": []
+            }
+          ],
+          "applications": []
+        }
+      }
+    ]
+  },
+  "constraintProfile": {
+    "schemaVersion": 1,
+    "id": "ecommerce-boolean-criteria",
+    "variables": [
+      {
+        "id": "catalog",
+        "bindings": [
+          {
+            "modelId": "feature-model",
+            "elementId": "catalog",
+            "attribute": {
+              "property": "Selected"
+            },
+            "trueValue": "Selected",
+            "falseValue": "Unselected"
+          },
+          {
+            "modelId": "component-model",
+            "elementId": "catalog-service",
+            "attribute": {
+              "path": [
+                "attributes",
+                "enabled"
+              ]
+            }
+          }
+        ]
+      },
+      {
+        "id": "payment",
+        "bindings": [
+          {
+            "modelId": "feature-model",
+            "elementId": "payment",
+            "attribute": {
+              "property": "Selected"
+            },
+            "trueValue": "Selected",
+            "falseValue": "Unselected"
+          },
+          {
+            "modelId": "component-model",
+            "elementId": "payment-service",
+            "attribute": {
+              "path": [
+                "attributes",
+                "enabled"
+              ]
+            }
+          }
+        ]
+      }
+    ],
+    "constraints": [
+      {
+        "id": "payment-needs-catalog",
+        "modelId": "feature-model",
+        "expression": {
+          "implies": [
+            {
+              "var": "payment"
+            },
+            {
+              "var": "catalog"
+            }
+          ]
+        }
+      },
+      {
+        "id": "catalog-required",
+        "modelId": "component-model",
+        "expression": {
+          "var": "catalog"
+        }
+      }
+    ],
+    "dependencies": [
+      {
+        "id": "checkout-services",
+        "sourceModelId": "feature-model",
+        "targetModelId": "component-model",
+        "when": {
+          "var": "payment"
+        },
+        "requires": {
+          "and": [
+            {
+              "var": "catalog"
+            },
+            {
+              "var": "payment"
+            }
+          ]
+        }
+      }
+    ],
+    "conditions": [
+      {
+        "id": "feature-model-checkout",
+        "modelId": "feature-model",
+        "conceptId": "checkout",
+        "expression": {
+          "and": [
+            {
+              "var": "catalog"
+            },
+            {
+              "var": "payment"
+            }
+          ]
+        }
+      },
+      {
+        "id": "component-model-checkout",
+        "modelId": "component-model",
+        "conceptId": "checkout",
+        "expression": {
+          "and": [
+            {
+              "var": "catalog"
+            },
+            {
+              "var": "payment"
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

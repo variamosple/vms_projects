@@ -1,0 +1,78 @@
+{
+  "schemaVersion": 1,
+  "before": {
+    "schemaVersion": 1,
+    "projectId": "ecommerce-demo",
+    "snapshotId": "before-1",
+    "scope": "complete",
+    "metamodels": {
+      "catalog-language": {"elements": {"Container": {}, "Item": {}}, "relationships": {"Contains": {"source": "Container", "target": ["Item"]}}},
+      "store-language": {"elements": {"Variant": {}}, "relationships": {}}
+    },
+    "project": {
+      "id": "ecommerce-demo",
+      "productLines": [{
+        "id": "stores",
+        "scope": {"models": []},
+        "domainEngineering": {"models": [{
+          "id": "base", "languageId": "catalog-language",
+          "elements": [
+            {"id": "root", "name": "Tienda", "type": "Container"},
+            {"id": "catalog", "name": "Catalogo", "type": "Item", "parentId": "root"}
+          ],
+          "relationships": [{"id": "contains", "type": "Contains", "sourceId": "root", "targetId": "catalog"}]
+        }]},
+        "applicationEngineering": {
+          "models": [],
+          "applications": [{
+            "id": "online-store", "models": [],
+            "adaptations": [{
+              "id": "retail", "models": [{
+                "id": "derived", "languageId": "store-language", "sourceModelIds": ["base"],
+                "elements": [{"id": "catalog", "name": "CatalogoWeb", "type": "Variant",
+                  "sourceModelElements": [{"modelId": "base", "elementId": "catalog"}]}],
+                "relationships": []
+              }]
+            }]
+          }]
+        }
+      }]
+    }
+  },
+  "after": {
+    "schemaVersion": 1,
+    "projectId": "ecommerce-demo",
+    "snapshotId": "after-1",
+    "scope": "complete",
+    "metamodels": {
+      "catalog-language": {"elements": {"Container": {}, "Item": {}}, "relationships": {"Contains": {"source": "Container", "target": ["Item"]}}},
+      "store-language": {"elements": {"Variant": {}}, "relationships": {}}
+    },
+    "project": {
+      "id": "ecommerce-demo",
+      "productLines": [{
+        "id": "stores",
+        "scope": {"models": []},
+        "domainEngineering": {"models": [{
+          "id": "base", "languageId": "catalog-language",
+          "elements": [{"id": "root", "name": "Tienda", "type": "Container"}],
+          "relationships": [{"id": "contains", "type": "Contains", "sourceId": "root", "targetId": "catalog"}]
+        }]},
+        "applicationEngineering": {
+          "models": [],
+          "applications": [{
+            "id": "online-store", "models": [],
+            "adaptations": [{
+              "id": "retail", "models": [{
+                "id": "derived", "languageId": "store-language", "sourceModelIds": ["base"],
+                "elements": [{"id": "catalog", "name": "CatalogoWeb", "type": "Variant",
+                  "sourceModelElements": [{"modelId": "base", "elementId": "catalog"}]}],
+                "relationships": []
+              }]
+            }]
+          }]
+        }
+      }]
+    }
+  }
+}

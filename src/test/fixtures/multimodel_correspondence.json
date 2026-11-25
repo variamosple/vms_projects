@@ -1,0 +1,53 @@
+{
+  "schemaVersion": 1,
+  "projectId": "ecommerce-criteria-demo",
+  "snapshotId": "criteria-1",
+  "scope": "complete",
+  "project": {
+    "id": "ecommerce-criteria-demo",
+    "productLines": [{
+      "id": "stores",
+      "scope": {"models": []},
+      "domainEngineering": {"models": [{
+        "id": "base", "languageId": "catalog-language",
+        "elements": [{"id": "catalog", "name": "Catalogo", "type": "Item", "properties": [
+          {"name": "SKU", "value": "CAT-001"}, {"name": "Enabled", "value": true}
+        ]}],
+        "relationships": []
+      }]},
+      "applicationEngineering": {"models": [], "applications": [{
+        "id": "online-store", "models": [], "adaptations": [{"id": "retail", "models": [{
+          "id": "derived", "languageId": "store-language", "sourceModelIds": ["base"],
+          "elements": [{"id": "catalog", "name": "CatalogoWeb", "type": "Variant", "properties": [
+            {"name": "Code", "value": "CAT-001"}, {"name": "Selected", "value": true}
+          ], "sourceModelElements": [{"modelId": "base", "elementId": "catalog"}]}],
+          "relationships": []
+        }]}]
+      }]}
+    }]
+  },
+  "correspondenceProfile": {
+    "schemaVersion": 1,
+    "id": "ecommerce-explicit-criteria",
+    "correspondences": [{
+      "id": "same-catalog-code", "level": "element",
+      "source": {"modelId": "derived", "elementType": "Variant"},
+      "target": {"modelId": "base", "elementType": "Item"},
+      "checks": [{"source": {"property": "Code"}, "target": {"property": "SKU"}, "operator": "equals"}]
+    }],
+    "dependencies": [{
+      "id": "selected-catalog-needs-enabled-origin",
+      "source": {"modelId": "derived", "elementId": "catalog"},
+      "target": {"modelId": "base", "elementId": "catalog"},
+      "when": [{"attribute": {"property": "Selected"}, "operator": "equals", "value": true}],
+      "requireOriginLink": true,
+      "conditions": [{"on": "target", "attribute": {"property": "Enabled"}, "operator": "equals", "value": true}]
+    }],
+    "requiredCorrespondences": [{
+      "id": "variant-needs-catalog",
+      "source": {"modelId": "derived", "elementType": "Variant"},
+      "target": {"modelId": "base", "elementType": "Item"},
+      "minimum": 1, "maximum": 1
+    }]
+  }
+}
