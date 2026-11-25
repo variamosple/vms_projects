@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .constraint_contracts import ConstraintRequest, ConstraintResult
+from .cli_input import read_local_capture
 from .constraint_profile import validate_profile, variables_in
 from .contracts import Status
 from .correspondence import _attribute, _equal
@@ -263,10 +264,10 @@ def validate_constraints(request: ConstraintRequest, *, max_checks: Optional[int
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evalúa RG09 a RG12 mediante criterios booleanos explícitos.")
-    parser.add_argument("snapshot", type=Path)
+    parser.add_argument("snapshot", type=Path, help="Archivo JSON dentro del directorio de trabajo.")
     args = parser.parse_args()
     try:
-        report = validate_constraints(json.loads(args.snapshot.read_text(encoding="utf-8")))
+        report = validate_constraints(read_local_capture(args.snapshot))
     except (OSError, ValueError, RecursionError) as error:
         parser.error(str(error))
     print(json.dumps(report, indent=2, ensure_ascii=True))

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .contracts import Coverage, Finding, Severity, Status, ValidationResult
+from .cli_input import read_local_capture
 from .correspondence import validate_correspondences
 from .constraints import validate_constraints
 from .versions import validate_versions
@@ -518,11 +519,10 @@ def validate_transition(request: TransitionRequest, *, max_impacts: Optional[int
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Analiza localmente RG13 a RG16 sobre dos capturas JSON.")
-    parser.add_argument("transition", type=Path, help="JSON con schemaVersion, before y after.")
+    parser.add_argument("transition", type=Path, help="JSON con schemaVersion, before y after, dentro del directorio de trabajo.")
     args = parser.parse_args()
     try:
-        with args.transition.open(encoding="utf-8") as source:
-            report = validate_transition(json.load(source))
+        report = validate_transition(read_local_capture(args.transition))
     except (OSError, ValueError, RecursionError) as error:
         parser.error(str(error))
     print(json.dumps(report, indent=2, ensure_ascii=True))

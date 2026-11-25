@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .contracts import Status
+from .cli_input import read_local_capture
 from .correspondence_contracts import CorrespondenceRequest, CorrespondenceResult
 from .correspondence_profile import validate_profile
 from .snapshot import MISSING, Model, Record, Snapshot, identifier
@@ -312,10 +313,10 @@ def validate_correspondences(request: CorrespondenceRequest, *, max_checks: Opti
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evalúa RG06 a RG08 con criterios explícitos sobre una captura local.")
-    parser.add_argument("snapshot", type=Path)
+    parser.add_argument("snapshot", type=Path, help="Archivo JSON dentro del directorio de trabajo.")
     args = parser.parse_args()
     try:
-        report = validate_correspondences(json.loads(args.snapshot.read_text(encoding="utf-8")))
+        report = validate_correspondences(read_local_capture(args.snapshot))
     except (OSError, ValueError, RecursionError) as error:
         parser.error(str(error))
     print(json.dumps(report, indent=2, ensure_ascii=True))
